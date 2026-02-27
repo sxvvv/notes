@@ -1,13 +1,20 @@
 # Triton 实现 Softmax
 ## 一、Softmax 数学定义
+
 $$\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_{j} e^{x_j}}$$
+
 直接算会溢出。减去行最大值后数学等价，但 exp 输入 ≤ 0，数值安全：
+
 $$\text{softmax}(x_i) = \frac{e^{x_i - \max(x)}}{\sum_{j} e^{x_j - \max(x)}}$$
+
 ## 二、并行策略
+
 输入矩阵 shape = `(n_rows, n_cols)`。Softmax 沿行独立计算，行与行之间零依赖。
 每个 Triton program（类似 CUDA block）负责若干行
 每一行用一个长度为 BLOCK_SIZE 的向量一次性处理所有列
+
 ## 三、Triton 语法速查
+
 在看 kernel 之前，先搞清楚几个核心 API：
 | 语法 | 含义 | 类比 |
 |------|------|------|
@@ -24,15 +31,23 @@ $$\text{softmax}(x_i) = \frac{e^{x_i - \max(x)}}{\sum_{j} e^{x_j - \max(x)}}$$
 ## 四、Triton 的指针寻址
 Triton 没有多维张量索引，全靠指针算术。理解这一点是理解 Triton 的关键。
 内存是一维的：
+
 row 0: [a00, a01, a02, a03]    地址: base+0, base+1, base+2, base+3
+
 row 1: [a10, a11, a12, a13]    地址: base+4, base+5, base+6, base+7
+
 row 2: [a20, a21, a22, a23]    地址: base+8, base+9, base+10, base+11
 
 访问第 row_idx 行的所有列:
+```python
 row_ptr   = base + row_idx * row_stride    # 行首地址
 col_offs  = tl.arange(0, BLOCK_SIZE)       # [0, 1, 2, ..., BLOCK_SIZE-1]
 ptrs      = row_ptr + col_offs             # 该行每个元素的地址向量
+```
+
 `row_stride` = 一行有多少个元素（连续存储时等于 `n_cols`），通过 `tensor.stride(0)` 获取。
+
+
 ## 五、Kernel 完整实现（带逐行注释）
 ```python
 import torch
