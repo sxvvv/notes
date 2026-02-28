@@ -119,7 +119,9 @@ def act_quant(x: torch.Tensor, block_size: int = 128):
 
 ### Triton 分块矩阵乘法回顾
 
-矩阵维度：$$A_{M \times K} \times B^T_{K \times N} = C_{M \times N}$$
+矩阵维度：
+
+$$A_{M \times K} \times B^T_{K \times N} = C_{M \times N}$$
 
 ```python
 pid_m = tl.program_id(axis=0)  # M 维度的块索引
@@ -141,9 +143,12 @@ a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
 b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
 ```
 
-为什么是 $W^T$？
-B 矩阵在内存中存储为 $(N, K)$，即每行是一个输出神经元的权重向量。
-但 b_ptrs 的索引维度是 (offs_k, offs_n)，加载出来的子块形状是 $(BLOCK\_SIZE\_K, BLOCK\_SIZE\_N)$。这等效于对 B 做了转置：从 $(N, K)$ 读取为 $(K, N)$ 的视图。
+**为什么是 $W^T$?**
+
+B 矩阵在内存中存储为(N, K)，即每行是一个输出神经元的权重向量。
+
+但 b_ptrs 的索引维度是 (offs_k, offs_n)，加载出来的子块形状是 $(BLOCK_{SIZE_K}, BLOCK_{SIZE_N})$。这等效于对 B 做了转置：从(N, K)读取为(K, N)的视图。
+
 循环中 b_ptrs += BLOCK_SIZE_K：移动的是 B 的第二维（K 维），说明 K 是 B 在内存中的连续维度，N 才是归约后的输出维度。因此实际计算的是 $A \times W^T$。
 
 ### 核心循环：分块归约 + 反量化
