@@ -177,7 +177,7 @@ for i in range(k):
        × b_s（恢复 W 的量级）
        = 近似 FP32 的真实结果
 
-每 $BLOCK_SIZE_K$ 个元素共享一个缩放因子，所以 $a_s$ 的维度是 $(BLOCK_SIZE_M,)$（M 维度上每行一个），$b_s$ 的维度是 $(BLOCK_SIZE_N,)$（N 维度上每列一个）。
+每 $BLOCK_{SIZE_K}$ 个元素共享一个缩放因子，所以 $a_s$ 的维度是 $(BLOCK_{SIZE_M},)$（M 维度上每行一个），$b_s$ 的维度是 $(BLOCK_{SIZE_N},)$（N 维度上每列一个）。
 
 ### 结果写回
 
