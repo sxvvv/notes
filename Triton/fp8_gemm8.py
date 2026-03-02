@@ -57,15 +57,33 @@ def _weight_dequant_kernel(
     M, N,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """
+    Triton 核函数：完成单个 BLOCK_SIZE×BLOCK_SIZE 块的反量化
+    Args:
+        x_ptr: FP8 权重矩阵的显存指针
+        s_ptr: 缩放因子矩阵的显存指针
+        y_ptr: 输出 FP32 矩阵的显存指针
+        M: 权重矩阵的行数
+        N: 权重矩阵的列数
+        BLOCK_SIZE: 分块大小（编译期常量）
+    """
+    # 1. 获取当前线程块的行/列分块 ID
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+    # 2. 计算列方向的总块数（向上取整）
     n_blocks = tl.cdiv(N, BLOCK_SIZE)
+    # 3. 生成当前块内的全局行/列索引
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # 4. 生成掩码：过滤超出矩阵维度的越界元素
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    # 5. 计算显存绝对偏移（2D→1D，行优先）
     offs = offs_m[:, None] * N + offs_n[None, :]
-    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    # 6. 加载 FP8 权重并转换为 FP32
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32) 
+    # 7. 加载当前块对应的缩放因子（单个标量）
     s = tl.load(s_ptr + pid_m * n_blocks + pid_n)
+    # 8. 执行反量化计算并存储结果
     tl.store(y_ptr + offs, x * s, mask=mask)
 def weight_dequant(
     x: torch.Tensor,
@@ -73,12 +91,20 @@ def weight_dequant(
     block_size: int = DEFAULT_BLOCK,
 ) -> torch.Tensor:
     """权重反量化 (M, N) → FP32。"""
+    # 1. 检查输入张量是否连续（Triton 要求显存连续，否则指针访问会出错）
     assert x.is_contiguous() and s.is_contiguous()
+    # 2. 检查张量维度：x 是 2D 权重矩阵，s 是 2D 缩放因子矩阵
     assert x.ndim == 2 and s.ndim == 2
+    # 3. 获取权重矩阵维度
     M, N = x.shape
+    # 4. 创建输出张量（FP32 精度，和 x 同设备）
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    # 5. 定义核函数的启动网格（grid）：决定多少个核函数实例并行运行
+    # triton.cdiv(M, block_size)：行方向的块数；triton.cdiv(N, block_size)：列方向的块数
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    # 6. 启动 Triton 核函数
     _weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    # 7. 返回反量化后的 FP32 矩阵
     return y
 # ============================================================
 #  FP8 GEMM:  C = A_q @ W_q^T  ⊙  (S_A ⊗ S_W)
@@ -113,9 +139,9 @@ def _fp8_gemm_kernel(
       a_s: (M, K // BLOCK_K)  每 BLOCK_K 列共享一个 s
       b_s: (N // BLOCK_K, K // BLOCK_K)  与 A 对齐的分块缩放
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    num_k_blocks = tl.cdiv(K, BLOCK_K)
+    pid_m = tl.program_id(0)  # 行方向分块 ID（对应 C 的 M 维度）
+    pid_n = tl.program_id(1)  # 列方向分块 ID（对应 C 的 N 维度）
+    num_k_blocks = tl.cdiv(K, BLOCK_K)  # K 维度的总块数（向上取整）
     # ---- 行列偏移 ----
     offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
@@ -129,13 +155,21 @@ def _fp8_gemm_kernel(
     # ---- 分块归约 ----
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for i in range(num_k_blocks):
+        # 9.1 生成 K 维度掩码（过滤最后一块的越界元素）
         k_mask = offs_k < (K - i * BLOCK_K)
+        
+        # 9.2 加载 A/B 的 FP8 数据（带掩码）
         a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
         b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        
+        # 9.3 加载对应分块的缩放因子
         sa = tl.load(a_s_ptrs + i)         # (BM,)
         sb = tl.load(b_s_ptrs + i)         # (BN,)
-        # dot → (BM, BN)  再乘缩放因子完成反量化
+        
+        # 9.4 核心运算：矩阵乘法 + 反量化（乘缩放因子）
         acc += tl.dot(a, b) * sa[:, None] * sb[None, :]
+        
+        # 9.5 指针偏移：处理下一个 K 分块
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K
     # ---- 写回 ----
