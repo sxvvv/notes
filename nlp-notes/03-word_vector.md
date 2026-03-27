@@ -82,9 +82,9 @@ $$\text{similarity} = \cos(\theta) = \frac{\mathbf{A} \cdot \mathbf{B}}{||\mathb
 
 用上面的例子算一下：令 **A** = `[1, 1, 1, 1, 0, 0]`，**B** = `[1, 1, 1, 0, 1, 1]`
 
-- **点积**：$1 \times 1 + 1 \times 1 + 1 \times 1 + 1 \times 0 + 0 \times 1 + 0 \times 1 = 3$
-- **模长**：$|\mathbf{A}| = \sqrt{1+1+1+1+0+0} = 2$，$|\mathbf{B}| = \sqrt{1+1+1+0+1+1} = \sqrt{5}$
-- **相似度**：$\cos(\theta) = \frac{3}{2 \times \sqrt{5}} \approx 0.67$
+- **点积**：$$1 \times 1 + 1 \times 1 + 1 \times 1 + 1 \times 0 + 0 \times 1 + 0 \times 1 = 3$$
+- **模长**：$$|\mathbf{A}| = \sqrt{1+1+1+1+0+0} = 2$，$|\mathbf{B}| = \sqrt{1+1+1+0+1+1} = \sqrt{5}$$
+- **相似度**：$$\cos(\theta) = \frac{3}{2 \times \sqrt{5}} \approx 0.67$$
 
 结果 0.67，说明这两条评论确实比较相似。
 
