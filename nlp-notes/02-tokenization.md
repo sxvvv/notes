@@ -88,11 +88,11 @@ $$\log P(B) = \log P(\text{今天}) + \log P(\text{天}) + \log P(\text{气}) + 
 
 由于"天气"是一个高频词，它的整体概率远大于"天"和"气"两个单字概率的乘积，因此：
 
-$$\log P(\text{天气}) \gg \log P(\text{天}) + \log P(\text{气}) \tag{2.4}$$
+$$\log P(\text{天气}) \gg \log P(\text{天}) + \log P(\text{气}) $$
 
 所以：
 
-$$\log P(A) > \log P(B) \tag{2.5}$$
+$$\log P(A) > \log P(B) $$
 
 动态规划会自动在每个位置完成这种比较，最终选出全局最优路径 A。
 
