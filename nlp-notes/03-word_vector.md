@@ -88,7 +88,11 @@ $$\text{similarity} = \cos(\theta) = \frac{\mathbf{A} \cdot \mathbf{B}}{||\mathb
 
 - **模长**：
 
-  $$|\mathbf{A}| = \sqrt{1+1+1+1+0+0} = 2$，$|\mathbf{B}| = \sqrt{1+1+1+0+1+1} = \sqrt{5}$$
+
+  $|\mathbf{A}| = \sqrt{1+1+1+1+0+0} = 2$，
+
+  $|\mathbf{B}| = \sqrt{1+1+1+0+1+1} = \sqrt{5}$
+
 
 - **相似度**：
 
