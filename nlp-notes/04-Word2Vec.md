@@ -219,14 +219,6 @@ $$\text{score} = x \cdot u_{target} $$
 
 ---
 
-## 练习
-
-1. 用自己的话解释：为什么"面粉"和"黄油"在主题模型中会得到相似的词向量？如果换成 Word2Vec 呢，原理有什么不同？
-2. 假设句子是"我 每天 早上 喝 咖啡"，窗口大小为 2，分别写出 CBOW 和 Skip-gram 在"早上"这个位置会生成怎样的训练样本。
-3. 想一想："苹果"在不同语境下含义不同，Word2Vec 为什么无法处理？如果你来设计，会怎么改进？
-
----
-
 ## 参考文献
 
 1. Deerwester, S., et al. (1990). *Indexing by latent semantic analysis*. Journal of the American Society for Information Science, 41(6), 391-407.
