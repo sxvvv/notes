@@ -51,6 +51,8 @@ for seq in [2048, 8192, 32768, 131072]:
 
 **方法**: 保留 attention sink (前 S 个 token) + 滑动窗口 (最近 W 个 token)
 
+![StreamingLLM 在 KV Cache 中的位置策略](images/streamingllm_position_in_cache.png)
+
 $$\text{KV Cache} = \{\text{sink tokens}\} \cup \{\text{recent W tokens}\}$$
 
 - 显存: O(S + W)，不随序列长度增长 → **无限长推理**

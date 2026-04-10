@@ -72,6 +72,9 @@ $$s_j = \left|\frac{\partial L}{\partial w_j}\bigg|_{W=W_0} \times w_j\right|$$
 ### 4.4.1 为什么非结构化稀疏需要专门硬件？
 
 非结构化剪枝产生不规则的稀疏模式：
+
+![结构化 vs 非结构化稀疏](images/uniform_vs_not_uniform.png)
+
 - 权重位置不连续 → **内存访问不规则** → cache miss 高
 - 普通GPU的矩阵乘法单元针对密集矩阵优化，稀疏矩阵无法高效利用
 

@@ -61,6 +61,8 @@ Schedule:   f.vectorize(x, 8).parallel(y)
 
 ### 11.4 TVM：端到端深度学习编译框架
 
+![TVM 编译框架概览](images/tvm_overview.png)
+
 TVM 把深度学习模型从各种前端（PyTorch/TensorFlow/ONNX）编译到各种后端（CUDA/Metal/x86/ARM）。
 
 **编译流程：**
@@ -157,6 +159,8 @@ $$O_{\text{new}} = \frac{e^{m - m_{\text{new}}} \cdot \ell \cdot O + e^{m' - m_{
 这个递推使得 softmax 可以在单遍扫描（分块处理）中完成，无需存储完整 $n \times n$ 矩阵。
 
 ### 11.7 Winograd 卷积
+
+![Winograd 卷积](images/winograd.png)
 
 对于 $F(m, r)$ Winograd 卷积（输出大小 $m$，滤波器大小 $r$），乘法次数为 $m + r - 1$，而朴素卷积需要 $m \times r$ 次乘法。
 

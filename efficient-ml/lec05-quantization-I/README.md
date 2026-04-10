@@ -4,13 +4,19 @@
 > 📄 [Slides](https://hanlab.mit.edu/courses/2024-fall-65940)
 > 📝 参考: [erectbranch 韩文笔记](https://github.com/erectbranch/MIT-Efficient-AI/tree/master/2022/lec05/summary01)
 
+![连续信号与离散量化对比](images/continuous-weight.png)
+
 量化（Quantization）是把连续信号映射到有限离散集合的过程。在深度学习中，就是把高精度数值（FP32）映射到低精度（INT8/INT4），从而减少模型大小、加速推理、降低功耗。
+
+![量化后的离散权重分布](images/discrete-weight.png)
 
 ---
 
 ## 5.1 数值数据类型 (Numeric Data Types)
 
 bit-width 越低，运算能耗越少：
+
+![不同bit-width的运算能耗对比](images/computation_cost.png)
 
 | 类型 | 位宽 | 动态范围 | 精度 | 能耗比(vs FP32) |
 |------|------|---------|------|----------------|
@@ -24,6 +30,8 @@ bit-width 越低，运算能耗越少：
 
 **Unsigned INT8**: range [0, 2^8 - 1] = [0, 255]
 
+![INT8无符号整数示例](images/int8_ex_1.png)
+
 **Signed INT8 (Two's Complement)**: range [-2^7, 2^7 - 1] = [-128, 127]
 
 ```
@@ -34,6 +42,8 @@ Signed:    00110001 (正数相同)
 例子: 十进制 -49
 Two's Complement: 11001111 (= ~00110000 + 1)
 ```
+
+![INT8补码表示示例](images/int8_ex_3.png)
 
 ### 5.1.2 Fixed-Point Number (定点数)
 
@@ -49,6 +59,8 @@ Sign(1bit) | Integer(3bit) | Fraction(4bit)
 = 4 + 0.25 = 4.25
 ```
 
+![定点数位域划分示意](images/fixed-point.png)
+
 ### 5.1.3 IEEE FP32 (浮点数)
 
 $$(-1)^{\text{sign}} \times (1 + \text{Fraction}) \times 2^{\text{Exponent} - 127}$$
@@ -57,17 +69,25 @@ $$(-1)^{\text{sign}} \times (1 + \text{Fraction}) \times 2^{\text{Exponent} - 12
 - Exponent: 8 bits (bias = 127)
 - Fraction (mantissa): 23 bits
 
+![IEEE 754 FP32位域结构](images/fp32_ieee754.png)
+
 ```
 FP32 表示 0.265625:
 0.265625 = 1.0625 × 2^{-2}
 → Sign=0, Exponent=125(01111101), Fraction=0.0625
 ```
 
+![FP32编码示例 0.265625](images/fp32_ieee754_ex.png)
+
 **Subnormal Numbers**: 当 Exponent=0 时，用线性表示极小值：
 
 $$(-1)^{\text{sign}} \times \text{Fraction} \times 2^{1 - 127}$$
 
 最小值: $2^{-149}$，最大 subnormal: $2^{-126} - 2^{-149}$
+
+![FP32数值范围与subnormal区间](images/fp32_ieee754_num_range.png)
+
+![Subnormal Numbers线性分布示意](images/subnormal_numbers.png)
 
 ### 5.1.4 FP16 vs BF16 — 关键区别
 

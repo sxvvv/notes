@@ -15,6 +15,12 @@
 | 无法并行 | state 依赖前一个 state → 无法并行计算 |
 | 语言无局部性 | 图像有局部性(相邻像素相关)，语言的依赖关系可以是任意距离 |
 
+![RNN 结构](images/rnn.png)
+
+![长距离依赖问题](images/rnn_problem_1.png)
+
+![无法并行问题](images/rnn_problem_2.png)
+
 ### 12.1.2 CNN for NLP
 
 - 用 1D 卷积处理文本，可以并行
@@ -33,6 +39,8 @@
                                                          ↓
                                               [MHA → Add&Norm → FFN → Add&Norm]
 ```
+
+![Transformer 完整架构](images/transformer.png)
 
 ### 12.2.2 Tokenizer
 
