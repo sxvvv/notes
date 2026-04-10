@@ -1,6 +1,6 @@
 # Lec02 深度学习基础与效率指标
 
-> 📺 [课程视频](https://www.youtube.com/watch?v=5HpLyZd1h0I) &nbsp;|&nbsp; 📄 [Slides](https://hanlab.mit.edu/courses/2024-fall-65940)
+> 📺 [课程视频](https://www.youtube.com/watch?v=I0nKjPpZmMU&feature=youtu.be) &nbsp;|&nbsp; 📄 [Slides](https://www.dropbox.com/scl/fi/pxvvqyq2yu6mwgk79bq5x/Lec02-Basics.pdf?rlkey=tsumfkhrglic55jnjs4yu66ni&e=1&st=cmwnvuvn&dl=0)
 
 ---
 
@@ -268,8 +268,6 @@ d_model = 768，d_ff = 4 × 768 = 3072。
 | Adam m | FP32 | 1×10⁹ × 4B | 4 GB |
 | Adam v | FP32 | 1×10⁹ × 4B | 4 GB |
 | **合计** | | | **16 GB** |
-
-> **勘误说明**：原文中 FP16 参数和梯度各算了 4 GB（即按 2×10⁹ × 2 计算），这里的 "2P" 可能来自把参数量记为 P 个参数、每个 2 bytes，写法上容易混淆。按 1B 参数 × 2 bytes/param，FP16 部分各为 2 GB，总计应为 **16 GB**；原文写 20 GB 对应的是把模型参数也保留了一份 FP32 副本用于更新后再转回 FP16 的标准做法，此时 FP32 master copy 那一行已经包含了这部分，FP16 参数实际是 forward 用的工作副本。两种算法的差异在于是否将工作副本和 master copy 同时计入，实际峰值更接近 20 GB（因为更新时两份同时存在）。
 
 Activations 未计入。ZeRO 优化通过在多卡间切分 optimizer states 来降低单卡内存。
 
