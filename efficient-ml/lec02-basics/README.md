@@ -1,13 +1,15 @@
 # Lec02 深度学习基础与效率指标
 
 > 📺 [课程视频](https://www.youtube.com/watch?v=I0nKjPpZmMU&feature=youtu.be) &nbsp;|&nbsp; 📄 [Slides](https://www.dropbox.com/scl/fi/pxvvqyq2yu6mwgk79bq5x/Lec02-Basics.pdf?rlkey=tsumfkhrglic55jnjs4yu66ni&e=1&st=cmwnvuvn&dl=0)
+>
+> 基于 MIT 6.5940 EfficientML 课程整理，加入个人理解与工程补充。
 
 ---
 
 ## 目录
 
 - [2.1 模型参数量](#21-模型参数量)
-- [2.2 FLOPs（浮点运算次数）](#22-flops)
+- [2.2 计算量：FLOPs 与 MACs](#22-计算量flops-与-macs)
 - [2.3 内存占用](#23-内存占用)
 - [2.4 数值精度格式](#24-数值精度格式)
 - [2.5 效率指标体系](#25-效率指标体系)
@@ -21,182 +23,201 @@
 
 ## 2.1 模型参数量
 
-参数量是模型的"体重"。一个 7B 模型，就是有 70 亿个浮点数要存、要搬、要算。搞效率优化，第一步永远是搞清楚参数在哪里、有多少。
+参数量决定了模型的存储开销和搬运代价。一个 7B 模型有 70 亿个浮点数需要保存、搬运和参与运算。效率优化的起点，永远是搞清楚参数在哪里、有多少。
 
 ### Linear 层
 
-全连接层本质就是矩阵乘加偏置：y = xW^T + b。
+全连接层就是矩阵乘加偏置：$y = xW^T + b$
 
-```
-params = C_in × C_out + C_out (bias)
-```
+$$
+\text{params} = C_{\text{in}} \times C_{\text{out}} + C_{\text{out}} \quad (\text{bias})
+$$
 
-`Linear(768, 3072)` → 768 × 3072 + 3072 = **2,362,368**。
+例如 `Linear(768, 3072)` → $768 \times 3072 + 3072 = 2{,}362{,}368$。
 
-这个数字在 Transformer 里会反复出现——FFN 的 up projection 就是这个规模。
+这个数字在 Transformer 中反复出现——FFN 的 up projection 就是这个规模。
 
 ### Conv2d 层
 
-```
-params = C_out × C_in × K_H × K_W + C_out (bias)
-```
+$$
+\text{params} = C_{\text{out}} \times C_{\text{in}} \times K_H \times K_W + C_{\text{out}} \quad (\text{bias})
+$$
 
-`Conv2d(64, 128, kernel_size=3)` → 128 × 64 × 3 × 3 + 128 = **73,856**。
+`Conv2d(64, 128, kernel_size=3)` → $128 \times 64 \times 3 \times 3 + 128 = 73{,}856$。
 
-卷积参数量跟输入图像多大没关系。不管输入是 224×224 还是 1024×1024，同一个卷积层参数量一样——因为同一组 kernel 在所有空间位置滑动复用（weight sharing）。这个性质对理解后面 FLOPs 和参数量的"脱钩"很关键。
+卷积参数量与输入空间分辨率无关。无论输入是 $224 \times 224$ 还是 $1024 \times 1024$，参数量不变——因为同一组 kernel 在所有空间位置滑动复用（weight sharing）。这个性质是后面理解 FLOPs 和参数量"脱钩"的关键。
 
 ### Transformer 中的 Multi-Head Attention
 
-MHA 里有四个线性投影：Q、K、V、O。
+MHA 包含四组线性投影：Q、K、V、O。
 
 | 投影 | 形状 |
 |------|------|
-| W_Q, W_K, W_V | d_model × d_model |
-| W_O | d_model × d_model |
+| $W_Q, W_K, W_V$ | $d_{\text{model}} \times d_{\text{model}}$ |
+| $W_O$ | $d_{\text{model}} \times d_{\text{model}}$ |
 
-忽略 bias 时总参数量：**4 × d_model²**。
+忽略 bias 时总参数量：$4 \times d_{\text{model}}^2$。
 
-GPT-2 小模型（d_model = 768）单层 attention 参数 = 4 × 768² ≈ 2.36M。但别忘了还有 FFN（通常比 attention 参数更多），后面会拆解。
+GPT-2 small（$d_{\text{model}} = 768$）单层 attention 参数 $= 4 \times 768^2 \approx 2.36\text{M}$。但还有 FFN（通常参数比 attention 更多），下文会拆解。
+
+<p align="center">
+  <img src="images/fig_transformer_params.png" width="700"/>
+</p>
+<p align="center"><b>图 1</b>：Transformer block 参数分布。FFN 占比约 2/3，attention 约 1/3。</p>
 
 ---
 
-## 2.2 FLOPs
+## 2.2 计算量：FLOPs 与 MACs
 
-FLOPs = Floating Point Operations，是硬件无关的计算量度量。先把几个容易混淆的术语理清：
+先把几个容易混淆的术语对齐：
 
 | 缩写 | 含义 | 举例 |
 |------|------|------|
-| **FLOPs** | 运算总次数（大写 O，复数 s） | "这个模型 forward 一次要 4.1 GFLOPs" |
-| **FLOPS** | 每秒运算次数（吞吐） | "A100 FP16 峰值 312 TFLOPS" |
-| **MACs** | Multiply-Accumulate | 1 MAC = 1 次乘法 + 1 次加法 = 2 FLOPs |
+| **MACs** | Multiply-Accumulate 次数 | 1 MAC = 一次乘法 + 一次累加 |
+| **FLOPs** | 浮点运算总次数（大写 O，复数 s） | 1 MAC = 2 FLOPs |
+| **FLOPS** | 每秒运算次数（吞吐能力） | "A100 FP16 峰值 312 TFLOPS" |
 
-很多论文和工具（比如 `thop`、`fvcore`）报告的是 MACs，跟 FLOPs 差 2 倍，读数据时注意看清楚单位。
+很多论文和工具（如 `thop`、`fvcore`）报告的是 MACs 而非 FLOPs，两者差 2 倍。读数据时务必看清单位。
+
+> **本文约定：** 后续公式统一以 MACs 为单位给出（这是多数工程论文的惯例）。如需换算成 FLOPs，乘以 2 即可。注意力机制的公式同理——给出的就是实际的乘-加操作次数，不再额外乘 2。
 
 ### Linear 层
 
-```
-FLOPs = 2 × B × C_in × C_out
-```
+$$
+\text{MACs} = B \times C_{\text{in}} \times C_{\text{out}}
+$$
 
-系数 2 就来自 MAC：一次乘、一次累加。
+每个输出元素需要 $C_{\text{in}}$ 次 multiply-accumulate。
 
 ### Conv2d 层
 
-```
-FLOPs = 2 × B × C_in × C_out × K_H × K_W × H_out × W_out
-```
+$$
+\text{MACs} = B \times C_{\text{in}} \times C_{\text{out}} \times K_H \times K_W \times H_{\text{out}} \times W_{\text{out}}
+$$
 
-跟参数量相比，多了 H_out × W_out 这一项。这就是参数量和 FLOPs 能"脱钩"的原因：3×3 卷积参数可能只有几十个，但在 1000×1000 的 feature map 上做一次 forward，FLOPs 是几百兆。
+与参数量相比，多出 $H_{\text{out}} \times W_{\text{out}}$。这就是参数量与计算量能"脱钩"的原因——$3 \times 3$ 卷积可能只有 81 个参数，但在 $1000 \times 1000$ 的 feature map 上做一次 forward，MACs 就有约 81M。
+
+<p align="center">
+  <img src="images/fig_flops_vs_params.png" width="600"/>
+</p>
+<p align="center"><b>图 2</b>：参数量与计算量可以显著脱钩。Embedding 参数量大但计算近乎为零（查表）；Conv 参数少但因 weight sharing 而计算密集。</p>
 
 ### Self-Attention
 
-设序列长度 N，模型维度 d：
+设序列长度 $N$，模型维度 $d$，单层 self-attention 的 MACs：
 
-```
-FLOPs_attn ≈ 4·N·d²  +  2·N²·d
-              ─────      ─────
-              QKV+O投影    注意力矩阵(QK^T + score×V)
-```
+$$
+\underbrace{4Nd^2}_{\text{QKV + O 投影}} + \underbrace{2N^2 d}_{\text{注意力矩阵 (}QK^T + \text{score} \cdot V\text{)}}
+$$
 
-两项分别是 O(Nd²) 和 O(N²d)。谁占主导取决于 N 和 d 的相对大小：
+两项分别对应 $O(Nd^2)$ 和 $O(N^2 d)$。谁占主导取决于 $N$ 和 $d$ 的相对大小：
 
-- N = 512, d = 768 → 第一项主导（短序列）
-- N = 32768, d = 768 → 第二项主导（长序列）
+- 当 $N < 2d$ 时，投影项主导（如 $N=512, d=768$，典型的短序列场景）
+- 当 $N > 2d$ 时，注意力矩阵项主导（如 $N=32768, d=768$，长序列场景）
 
-所有长上下文优化工作（FlashAttention、Ring Attention、Sparse Attention）都是在处理 N²d 这一项。
+长上下文优化（FlashAttention、Ring Attention、Sparse Attention）本质上都是在压缩 $N^2 d$ 这一项。
+
+<p align="center">
+  <img src="images/fig_attention_flops.png" width="600"/>
+</p>
+<p align="center"><b>图 3</b>：Self-Attention 计算量随序列长度的变化。交叉点在 $N = 2d$，之后注意力矩阵的二次项成为瓶颈。</p>
+
+> **关于公式中的系数约定：** 这里写 $4Nd^2$ 而非 $8Nd^2$，是因为以 MAC 计数。每个线性投影对矩阵 $(N, d) \times (d, d)$ 做乘-累加，MACs $= N \cdot d \cdot d$。四个投影（Q/K/V/O）共 $4Nd^2$ MACs。注意力矩阵部分，$QK^T$ 是 $(N, d) \times (d, N)$，MACs $= N^2 d$；score $\times V$ 是 $(N, N) \times (N, d)$，MACs $= N^2 d$；合计 $2N^2 d$ MACs。如果要转换成 FLOPs，整个公式乘 2 得到 $8Nd^2 + 4N^2 d$，这与部分文献（如 Megatron-LM 论文）的写法一致。
 
 ---
 
 ## 2.3 内存占用
 
-新手最常犯的错误："7B 模型，FP16 就是 14GB，显卡放得下就能训练"——差远了。
+常见的误解："7B 模型 FP16 就是 14 GB，显卡装得下就能训。"实际差得远。
 
-训练时的内存由四个部分组成：
+训练时的内存由四部分构成：
 
-```
-Memory_train = 权重 + 梯度 + Optimizer States + Activations
-```
+$$
+\text{Memory}_{\text{train}} = \text{权重} + \text{梯度} + \text{Optimizer States} + \text{Activations}
+$$
 
 | 组成 | FP32 Adam | 说明 |
 |------|-----------|------|
-| 权重 | 4P bytes | 需要参与前向和反向 |
+| 权重 | 4P bytes | 参与前向和反向 |
 | 梯度 | 4P bytes | 反向传播产生，与权重等大 |
-| Adam m（一阶矩） | 4P bytes | 维护梯度的指数移动平均 |
-| Adam v（二阶矩） | 4P bytes | 维护梯度平方的指数移动平均 |
-| **仅参数相关合计** | **16P bytes** | 还没算 activations |
+| Adam $m$（一阶矩） | 4P bytes | 梯度的指数移动平均 |
+| Adam $v$（二阶矩） | 4P bytes | 梯度平方的指数移动平均 |
+| **仅参数相关合计** | **16P bytes** | 未包含 activations |
 
-7B 模型，纯 FP32 Adam 训练：16 × 7 × 10⁹ = **112 GB**，这还不算 activations。一张 A100 80GB 连参数相关内存都塞不下。
+7B 模型纯 FP32 Adam 训练：$16 \times 7 \times 10^9 = 112 \text{ GB}$——一张 A100 80GB 连参数相关内存都放不下，还没算 activations。
 
-所以实践中必须：
-1. 混合精度——权重和梯度存 FP16/BF16，optimizer states 存 FP32
-2. ZeRO——把 optimizer states 切分到多张卡
-3. Gradient checkpointing——用计算换 activation 内存
+<p align="center">
+  <img src="images/fig_memory_breakdown.png" width="700"/>
+</p>
+<p align="center"><b>图 4</b>：7B 模型的训练内存拆解。混合精度并不能显著节省 optimizer states（仍为 FP32），其主要收益在于计算加速和 activation 内存的缩减。</p>
+
+实践中必须组合使用多种技术：
+
+1. **混合精度** —— 权重和梯度存 FP16/BF16，optimizer states 存 FP32
+2. **ZeRO / FSDP** —— 把 optimizer states 切分到多张卡
+3. **Gradient checkpointing** —— 用重计算换 activation 内存
 
 ### 推理内存与 memory-bandwidth 瓶颈
 
-推理时不需要梯度和 optimizer states，但有另一个问题：**KV cache**。
+推理时不需要梯度和 optimizer states，但有另一个大户：**KV cache**。
 
-LLM decode 阶段（自回归生成），每个 token 的生成过程：
+LLM decode 阶段（自回归生成）每生成一个 token 的过程：
 1. 把全部模型权重从 HBM 读一遍
-2. 做一个矩阵-向量乘法（因为 batch=1 时新 token 只有一个）
+2. 做一次矩阵-向量乘（batch=1 时新 token 只有一个）
 3. 更新 KV cache
 
 ```
 7B FP16 → 14 GB 权重
 A100 HBM 带宽 ≈ 2 TB/s
-→ 光搬权重的延迟 ≈ 14 / 2000 = 7 ms/token ≈ ~143 tokens/s 上限
+光搬权重的延迟 ≈ 14 / 2000 = 7 ms/token ≈ ~143 tokens/s 上限
 ```
 
-这就是 decode 阶段是 memory-bound 的根本原因：算力根本没用满，瓶颈在搬数据。
+这是 decode 阶段 memory-bound 的根本原因：算力大量空闲，瓶颈在数据搬运。
+
+<p align="center">
+  <img src="images/fig_kv_cache.png" width="600"/>
+</p>
+<p align="center"><b>图 5</b>：KV cache 随序列长度线性增长，随 batch size 线性放大。大 batch + 长序列下 KV cache 内存可远超模型权重本身。</p>
 
 ---
 
 ## 2.4 数值精度格式
 
-### 浮点数回顾
+### 浮点数结构
 
-IEEE 754 浮点数 = 符号位 + 指数 + 尾数：
+IEEE 754 浮点数由三部分构成：符号位 + 指数 + 尾数。
 
-```
-value = (-1)^sign × 2^(exponent - bias) × (1 + mantissa)
-```
+$$
+\text{value} = (-1)^{\text{sign}} \times 2^{(\text{exponent} - \text{bias})} \times (1 + \text{mantissa})
+$$
 
-指数决定"能表示多大/多小的数"（动态范围），尾数决定"相邻两个可表示数之间的间距"（精度）。
+指数位决定动态范围（能表示多大/多小的数），尾数位决定精度（相邻两个可表示值的间距）。
 
-### 格式对比
-
-| 格式 | 位宽 | 指数 | 尾数 | 最大值 | 典型用途 |
-|------|------|------|------|--------|----------|
-| FP32 | 32 | 8 | 23 | ~3.4×10³⁸ | 精确计算、optimizer states |
-| FP16 | 16 | 5 | 10 | 65504 | 推理（需 loss scaling） |
-| BF16 | 16 | 8 | 7 | ~3.4×10³⁸ | 训练主流格式 |
-| INT8 | 8 | — | — | [-128, 127] | 量化推理 |
-| INT4 | 4 | — | — | [-8, 7] | 激进量化 |
+<p align="center">
+  <img src="images/fig_precision_formats.png" width="700"/>
+</p>
+<p align="center"><b>图 6</b>：常用数值格式的位宽分配。BF16 和 FP32 共享相同的 8-bit 指数，因而动态范围一致；FP16 的 5-bit 指数使其最大值仅为 65504。</p>
 
 ### FP16 vs BF16：为什么 LLM 训练选 BF16
 
-FP16 的问题在 5 bit 指数：最大值只有 65504。训练 LLM 时 attention score（尤其是 pre-softmax logits）或 loss 值稍微大一点就溢出成 inf，整个训练崩掉。所以用 FP16 训练必须搭配 loss scaling：先把 loss 乘一个大数（比如 1024），让梯度的数值范围抬上来避免 underflow，反向传播之后再除回去。这套流程能 work，但增加了工程复杂度，而且 scale factor 选不好还会出问题。
+FP16 的问题在 5-bit 指数：最大可表示值仅 65504。LLM 训练中 attention score（尤其是 pre-softmax logits）或 loss 值略大就会溢出为 `inf`，导致训练崩溃。因此 FP16 训练必须搭配 loss scaling：先把 loss 乘一个大常数（如 1024）抬高梯度数值范围以避免 underflow，反向传播后再除回来。这套流程可行但增加了工程复杂度，scale factor 选取不当仍会出问题。
 
-BF16 的 8 bit 指数跟 FP32 完全一样，动态范围不受限，根本不需要 loss scaling。代价是尾数只有 7 bit（FP16 有 10 bit），精度更粗糙。但实践证明对训练收敛几乎没影响。
+BF16 的 8-bit 指数与 FP32 一致，动态范围不受限，不需要 loss scaling。代价是尾数只有 7 bit（FP16 有 10 bit），精度更低。但实际训练中这点精度损失对收敛的影响可以忽略。
 
-还有个工程上的好处：FP32 转 BF16 只要截掉低 16 位就行，不需要任何舍入逻辑。
+工程上还有一个好处：FP32 转 BF16 只需截断低 16 位，无需额外的 rounding 逻辑。
 
-现在 A100/H100 上几乎所有大模型训练都用 BF16。
+当前 A100 / H100 上的大模型训练几乎统一使用 BF16。
 
 ### 整数格式的能效优势
 
-量化的核心收益不只是省内存，还有**能耗**。整数运算电路比浮点简单得多。
+量化的核心收益不仅在于省内存，更在于**节能**。整数运算电路比浮点简单得多。
 
-Horowitz 2014 (45nm) 的经典数据：
+<p align="center">
+  <img src="images/fig_energy_cost.png" width="600"/>
+</p>
+<p align="center"><b>图 7</b>：不同精度下单次运算的能耗（Horowitz 2014, 45nm）。INT8 乘法相比 FP32 乘法约省 23 倍能耗。</p>
 
-| 运算 | 能耗 (pJ) |
-|------|----------|
-| FP32 MUL | 4.6 |
-| FP32 ADD | 0.9 |
-| INT8 MUL | 0.2 |
-| INT8 ADD | 0.03 |
-
-INT8 矩阵乘相比 FP32 大约省 **18–20× 能耗**。在移动端和边缘设备上，这不是"nice to have"而是"must have"。
+在移动端和边缘设备上，能耗往往是比计算量更严格的约束。
 
 ---
 
@@ -204,55 +225,63 @@ INT8 矩阵乘相比 FP32 大约省 **18–20× 能耗**。在移动端和边缘
 
 ### Latency
 
-LLM 场景有特殊的延迟指标拆分：
+LLM 场景的延迟指标需要拆分为两个阶段：
 
 | 指标 | 含义 | 主要影响因素 |
 |------|------|-------------|
-| TTFT | Time To First Token，首 token 延迟 | prompt 长度 → prefill 是 compute-bound |
-| TPOT | Time Per Output Token | 模型大小 × 带宽 → decode 是 memory-bound |
-| P99 | 第 99 百分位延迟 | 线上 SLA 几乎都看 P99，不看平均 |
+| TTFT | Time To First Token，首 token 延迟 | prompt 长度 → prefill 阶段是 compute-bound |
+| TPOT | Time Per Output Token | 模型大小 × 带宽 → decode 阶段是 memory-bound |
+| P99 | 第 99 百分位延迟 | 线上 SLA 通常看 P99 而非平均 |
 
-TTFT 和 TPOT 由不同因素主导，优化手段也不同。这是 vLLM 做 continuous batching 时需要平衡的核心 trade-off。
+TTFT 和 TPOT 由不同因素主导，优化手段也不同。这正是 vLLM continuous batching 需要平衡的核心 trade-off。
 
 ### Throughput
 
-```
-Throughput = batch_size / latency
-```
+$$
+\text{Throughput} = \text{batch\_size} / \text{latency}
+$$
 
-加大 batch 能提吞吐（GPU 利用率上去了），但单条请求的延迟会变长。生产环境的核心问题就是在 latency SLA 约束下最大化 throughput。
+增大 batch 可提升吞吐（GPU 利用率上升），但单条请求的延迟会增加。生产环境的核心问题是在 latency SLA 约束下最大化 throughput。
 
 ### Arithmetic Intensity 与 Roofline 模型
 
-```
-Arithmetic Intensity (AI) = FLOPs / Bytes_accessed
-```
+$$
+\text{Arithmetic Intensity (AI)} = \frac{\text{FLOPs}}{\text{Bytes\_accessed}}
+$$
 
-AI 这个指标告诉你一个 kernel 每搬一个 byte 做多少次计算。
+AI 衡量一个 kernel 每搬运一个 byte 做多少次计算。
 
 | 场景 | AI | 瓶颈 |
 |------|-----|------|
-| LLM decode (batch=1) | ~1（每读 2B 做 2 FLOPs） | Memory-bound |
+| LLM decode (batch=1) | ~1 | Memory-bound |
 | 大 batch matmul / prefill | 很高 | Compute-bound |
 | Softmax / LayerNorm | 极低（element-wise） | Memory-bound |
 
-**Roofline 模型**把这件事画成图：
+**Roofline 模型**将这个关系可视化：
 
-```
-实际性能 = min(峰值算力, 峰值带宽 × AI)
-```
+$$
+\text{实际性能} = \min(\text{峰值算力},\;\text{峰值带宽} \times \text{AI})
+$$
 
-横轴是 AI，纵轴是实际 FLOPS。AI 低于某个拐点（= 峰值算力 / 峰值带宽）时，性能被带宽限住；高于拐点才能被算力限住。
+<p align="center">
+  <img src="images/fig_roofline.png" width="650"/>
+</p>
+<p align="center"><b>图 8</b>：Roofline 模型（A100 FP16）。Ridge point 约在 AI = 156。低于此值的 kernel 性能受限于带宽，高于此值才受限于算力。</p>
 
-A100 的拐点大约在 AI ≈ 156（312 TFLOPS / 2 TB/s）。也就是说一个 kernel 的 AI 低于 156 时，你再怎么优化计算也没用，瓶颈在搬数据。
+A100 的 ridge point $\approx 312 \text{ TFLOPS} / 2 \text{ TB/s} = 156$。对于 AI 低于 156 的 kernel，优化计算逻辑收效甚微，瓶颈在数据搬运。
+
+<p align="center">
+  <img src="images/fig_arithmetic_intensity.png" width="650"/>
+</p>
+<p align="center"><b>图 9</b>：常见操作的 Arithmetic Intensity 在频谱上的位置。LLM decode（batch=1）的 AI 约为 1，远低于 A100 ridge point。</p>
 
 ### MBU（Memory Bandwidth Utilization）
 
-```
-MBU = 实际带宽利用 / 硬件峰值带宽
-```
+$$
+\text{MBU} = \frac{\text{实际带宽利用}}{\text{硬件峰值带宽}}
+$$
 
-Decode 阶段是纯 memory-bound，MBU 直接反映实现效率。好的 LLM serving engine 在 decode 阶段 MBU 能做到 70-80%+。
+Decode 阶段是纯 memory-bound 场景，MBU 直接反映工程实现效率。优秀的 LLM serving engine 在 decode 阶段 MBU 可达 70–80%+。
 
 ---
 
@@ -260,42 +289,44 @@ Decode 阶段是纯 memory-bound，MBU 直接反映实现效率。好的 LLM ser
 
 ### ResNet-50 第一层
 
-`Conv2d(3, 64, kernel_size=7, stride=2, padding=3)`，输入 224×224。
+`Conv2d(3, 64, kernel_size=7, stride=2, padding=3)`，输入 $224 \times 224$。
 
 参数量：
 
-```
-P = 64 × 3 × 7 × 7 = 9,408（无 bias）
-```
+$$
+P = 64 \times 3 \times 7 \times 7 = 9{,}408 \quad (\text{无 bias})
+$$
 
 输出分辨率：
 
-```
-H_out = floor((224 + 2×3 - 7) / 2 + 1) = 112
-```
+$$
+H_{\text{out}} = \lfloor (224 + 2 \times 3 - 7) / 2 + 1 \rfloor = 112
+$$
 
-FLOPs：
+MACs：
 
-```
-FLOPs = 2 × 64 × 3 × 7 × 7 × 112 × 112 ≈ 236 MFLOPs
-```
+$$
+\text{MACs} = 64 \times 3 \times 7 \times 7 \times 112 \times 112 \approx 118\text{M}
+$$
 
-一个只有 9408 个参数的层，FLOPs 就有 236M。这就是 Conv 的特点：参数少、计算重（因为 weight sharing 在空间维度上重复计算）。
+（如以 FLOPs 计则为 $\approx 236\text{M}$）
+
+一个只有 9408 个参数的层，MACs 约 118M。这是 Conv 的典型特征：参数量小但计算密集（weight sharing 在空间维度上反复使用同一组参数）。
 
 ### GPT-2 (117M) 单层参数拆解
 
-d_model = 768，d_ff = 3072（= 4 × d_model）。
+$d_{\text{model}} = 768$，$d_{\text{ff}} = 3072 = 4 \times d_{\text{model}}$。
 
 | 模块 | 参数量 |
 |------|--------|
-| Attention: 4 × (768² + 768) | 2,362,368 |
-| FFN: 768×3072 + 3072 + 3072×768 + 768 | 4,722,432 |
-| 2 × LayerNorm: 2 × (768 + 768) | 3,072 |
+| Attention: $4 \times (768^2 + 768)$ | 2,362,368 |
+| FFN: $768 \times 3072 + 3072 + 3072 \times 768 + 768$ | 4,722,432 |
+| $2 \times$ LayerNorm: $2 \times (768 + 768)$ | 3,072 |
 | **单层合计** | **~7.09M** |
 
-12 层 → ~85M。加上 token embedding（50257×768 ≈ 38.6M）就是 ~124M。实际公开的 GPT-2 small 约 117M，因为它的 token embedding 和 output head 权重共享（weight tying），少算了一份。
+12 层 → ~85M。加上 token embedding（$50257 \times 768 \approx 38.6\text{M}$）约 124M。实际公开的 GPT-2 small 约 117M，差异来源于 token embedding 和 output head 权重共享（weight tying），避免了重复计算。
 
-一个值得注意的比例：FFN 参数 / Attention 参数 ≈ 2:1。所以 Transformer 里参数大头在 FFN，不在 attention。
+值得注意的比例：FFN 参数 / Attention 参数 $\approx 2 : 1$。Transformer 中参数的大头在 FFN，不在 attention。
 
 ### 混合精度训练内存（1B 模型）
 
@@ -304,19 +335,19 @@ d_model = 768，d_ff = 3072（= 4 × d_model）。
 | 前向/反向用的参数 | BF16 | 2 GB |
 | 梯度 | BF16 | 2 GB |
 | Master weights（optimizer 维护） | FP32 | 4 GB |
-| Adam m | FP32 | 4 GB |
-| Adam v | FP32 | 4 GB |
+| Adam $m$ | FP32 | 4 GB |
+| Adam $v$ | FP32 | 4 GB |
 | **合计（不含 activations）** | | **16 GB** |
 
-跟纯 FP32 的 16 GB 一样？是的——混合精度的主要收益在于 **计算速度**（BF16 matmul 在 Tensor Core 上快 2-4 倍）和 **activation 内存**（中间结果存 BF16），而不是 optimizer states 的内存。Optimizer states 始终是 FP32 的大头。要砍 optimizer states 内存，得靠 ZeRO 或 FSDP 分片。
+跟纯 FP32 的 16 GB 一样？是的——混合精度的主要收益在于**计算速度**（BF16 matmul 在 Tensor Core 上快 2–4 倍）和 **activation 内存**（中间结果存 BF16），而不是 optimizer states。Optimizer states 始终占据 FP32 的大头，要削减它只能靠 ZeRO 或 FSDP 分片。
 
 ---
 
-## 代码：从手写到工业实践
+## 代码 
 
 ### 基础工具函数
 
-这几个函数是日常 debug 和 profiling 的起点：
+日常 debug 和 profiling 的起点：
 
 ```python
 import torch
@@ -325,7 +356,7 @@ from typing import Tuple
 
 
 def count_parameters(model: nn.Module) -> Tuple[int, int]:
-    """统计可训练 / 总参数量。任何模型丢进来就能用。"""
+    """统计可训练 / 总参数量。"""
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return trainable, total
@@ -337,30 +368,27 @@ def param_memory_mb(model: nn.Module, dtype_bytes: int = 2) -> float:
     return total * dtype_bytes / (1024 ** 2)
 ```
 
-### HuggingFace Transformers 里的实际写法
+### HuggingFace Transformers 的参数量统计
 
-在 HuggingFace transformers 仓库里，参数量统计不是简单的 `sum(p.numel())`。看 `modeling_utils.py` 里 `PreTrainedModel` 的实现：
+HuggingFace 不是简单的 `sum(p.numel())`。关键设计考量：
 
 ```python
-# transformers/modeling_utils.py 中 num_parameters() 的核心逻辑
-# 简化版，展示关键设计决策
+# transformers/modeling_utils.py 中 num_parameters() 的核心逻辑（简化）
 
-def num_parameters(self, only_trainable: bool = False, 
-                   exclude_embeddings: bool = False) -> int:
+def num_parameters(self, only_trainable=False, exclude_embeddings=False):
     """
-    HF 比朴素版本多考虑两件事：
-    1. exclude_embeddings —— 很多论文报告参数量时不算 embedding，
-       因为 embedding 不参与主要计算（只是查表），而且如果有 weight tying
-       会导致重复计算。
-    2. 去重 —— 用 data_ptr() 检测共享权重，避免重复统计。
-       典型场景：GPT-2 的 token embedding 和 lm_head 共享权重。
+    两个工程细节：
+    1. exclude_embeddings —— 论文常不算 embedding 参数
+       （embedding 只做查表，不贡献实际计算）
+    2. 去重 —— 用 data_ptr() 检测共享权重，避免重复统计
+       典型场景：GPT-2 的 token embedding 和 lm_head 共享权重
     """
     if exclude_embeddings:
         embedding_params = sum(
             p.numel() for p in self.get_input_embeddings().parameters()
         )
     
-    # 关键：用 set(data_ptr) 去重共享参数
+    # 用 set(data_ptr) 去重共享参数
     seen = set()
     total = 0
     for name, p in self.named_parameters():
@@ -368,7 +396,7 @@ def num_parameters(self, only_trainable: bool = False,
             continue
         ptr = p.data_ptr()
         if ptr in seen:
-            continue  # 跳过共享权重
+            continue
         seen.add(ptr)
         total += p.numel()
     
@@ -377,51 +405,47 @@ def num_parameters(self, only_trainable: bool = False,
     return total
 ```
 
-这段代码揭示了两个实战中容易踩的坑：
-1. **Weight tying**：GPT-2、LLaMA 等模型的 input embedding 和 output head 共享权重。朴素的 `sum(p.numel())` 会重复计算。
-2. **Embedding 的特殊性**：Embedding 层参数量可以很大（vocab_size × d_model），但它的"计算"只是查表（gather），FLOPs 贡献微乎其微。
+两个实战常见的坑：
+- **Weight tying**：GPT-2、LLaMA 等模型的 input embedding 和 output head 共享权重，朴素的 `sum(p.numel())` 会重复计算。
+- **Embedding 的特殊性**：Embedding 参数量可以很大（$\text{vocab\_size} \times d_{\text{model}}$），但"计算"只是一次 gather 操作，FLOPs 贡献微乎其微。
 
-### FLOPs 估算：手写 vs 工具
+### 计算量估算：手写 vs 工具
 
-手写：
+手写（以 MACs 为单位）：
 
 ```python
-def flops_linear(B: int, in_f: int, out_f: int) -> int:
-    """FLOPs = 2 × B × in × out（MAC 的 2）"""
-    return 2 * B * in_f * out_f
+def macs_linear(B: int, in_f: int, out_f: int) -> int:
+    """Linear 层的 MACs。"""
+    return B * in_f * out_f
 
 
-def flops_attention(B: int, N: int, d: int) -> int:
-    """Self-attention FLOPs 估算（单层）
+def macs_attention(B: int, N: int, d: int) -> int:
+    """Self-attention MACs 估算（单层）。
     
-    4Nd² 来自 Q/K/V/O 四个 linear projection（每个是 2×N×d²，共 4 个）
-    2N²d 来自 QK^T（N×N 矩阵乘，2N²d）和 attn×V（同量级）
+    4*N*d^2 : Q/K/V/O 四个 projection（每个 N*d*d MACs）
+    2*N^2*d : QK^T + attn @ V（每个 N*N*d MACs）
     """
-    proj = 4 * N * d * d     # QKV + O projection: 4 × (2×N×d×d) / 2
-    attn = 2 * N * N * d     # QK^T + score @ V
-    return B * 2 * (proj // (2) + attn // (2))
-    # 更直接的写法：
-    # return B * (4 * 2 * N * d * d + 2 * 2 * N * N * d)
+    proj = 4 * N * d * d
+    attn = 2 * N * N * d
+    return B * (proj + attn)
 ```
 
-实际项目中常用 `calflops` 或 Meta 的 `fvcore` 来自动算：
+实际项目中常用 `calflops` 或 Meta 的 `fvcore` 自动计算：
 
 ```python
-# 用 calflops（pip install calflops）
-# 这是 LLM 社区比较常用的 FLOPs profiler
 from calflops import calculate_flops
 
 flops, macs, params = calculate_flops(
     model=model,
-    input_shape=(1, 128),      # (batch, seq_len)
+    input_shape=(1, 128),
     transformer_tokenizer=tokenizer,
 )
 print(f"FLOPs: {flops}  MACs: {macs}  Params: {params}")
 ```
 
-但注意：**自动工具的数字不一定对**。特别是涉及动态形状（attention mask、变长序列）时，自动 profiler 经常给出误导性的数字。手动推导公式能力是基本功，不能完全依赖工具。
+但注意：**自动工具不一定准确**。涉及动态形状（attention mask、变长序列）时，自动 profiler 容易给出误导性数字。手动推导能力是基本功，不能完全依赖工具。
 
-### 数值精度：实际观察
+### 数值精度：实际验证
 
 ```python
 import torch
@@ -430,16 +454,14 @@ import torch
 x = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
 print(f"FP16 最大误差: {(x - x.half().float()).abs().max():.2e}")
 print(f"BF16 最大误差: {(x - x.bfloat16().float()).abs().max():.2e}")
-# FP16 精度更高（10 bit 尾数），BF16 更粗糙（7 bit 尾数）
 
-# FP16 溢出 —— 这就是训练炸掉的典型原因
+# FP16 溢出
 big = torch.tensor(65505.0)
-print(f"65505 → FP16: {big.half()}")     # inf！
+print(f"65505 → FP16: {big.half()}")     # inf
 print(f"65505 → BF16: {big.bfloat16()}")  # 65536.0，安全
 
-# 更贴近实际的场景：大 attention score
-# pre-softmax logits 在训练初期可能很大
-scores = torch.randn(1, 12, 2048, 2048) * 30  # 模拟未归一化的 attention
+# 模拟未归一化的 attention score
+scores = torch.randn(1, 12, 2048, 2048) * 30
 print(f"FP16 overflow count: {torch.isinf(scores.half()).sum()}")
 print(f"BF16 overflow count: {torch.isinf(scores.bfloat16()).sum()}")
 ```
@@ -458,147 +480,99 @@ class TransformerBlock(nn.Module):
     结构对标 GPT-2 / LLaMA 的基本 pattern：
     - Pre-norm（LayerNorm 在 attention / FFN 之前）
     - GELU activation
-    - 无 bias（现代 LLM 通常 bias=False 省参数）
+    - 无 bias（现代 LLM 通常 bias=False）
     """
     
-    def __init__(self, d_model: int = 256, n_heads: int = 4, d_ff: int = 1024):
+    def __init__(self, d_model=256, n_heads=4, d_ff=1024):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_head = d_model // n_heads
         self.n_heads = n_heads
         
-        # Attention projections — 合并成一个 Linear 更高效
-        # 很多开源实现（LLaMA、Mistral）都把 QKV 合并
+        # QKV 合并为一个 Linear（LLaMA、Mistral 均如此）
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         
-        # FFN — LLaMA 用 SwiGLU，这里简化为 GELU
+        # FFN（LLaMA 用 SwiGLU，这里简化为 GELU）
         self.up = nn.Linear(d_model, d_ff, bias=False)
         self.down = nn.Linear(d_ff, d_model, bias=False)
         
-        # Pre-norm
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, N, D = x.shape
         
-        # --- Self-Attention ---
+        # Self-Attention
         h = self.ln1(x)
         qkv = self.qkv(h).reshape(B, N, 3, self.n_heads, self.d_head)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, d_head)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         
-        # Scaled dot-product attention
-        # PyTorch 2.0+ 提供了 F.scaled_dot_product_attention，
-        # 会自动 dispatch 到 FlashAttention kernel
+        # PyTorch 2.0+ 会自动 dispatch 到 FlashAttention kernel
         attn_out = F.scaled_dot_product_attention(q, k, v)
-        
         attn_out = attn_out.transpose(1, 2).reshape(B, N, D)
         x = x + self.o_proj(attn_out)
         
-        # --- FFN ---
+        # FFN
         h = self.ln2(x)
         x = x + self.down(F.gelu(self.up(h)))
         
         return x
-
-
-if __name__ == "__main__":
-    block = TransformerBlock(d_model=256, n_heads=4, d_ff=1024)
-    trainable, total = count_parameters(block)
-    print(f"Transformer Block 参数量: {total:,}")
-    
-    # 逐模块拆解
-    for name, module in block.named_modules():
-        if isinstance(module, nn.Linear):
-            n = sum(p.numel() for p in module.parameters())
-            print(f"  {name}: {n:,}")
-    
-    # 不同精度内存
-    for label, nbytes in [("FP32", 4), ("BF16", 2), ("INT8", 1)]:
-        print(f"{label} 参数内存: {total * nbytes / 1024**2:.2f} MB")
-    
-    # FLOPs 手动估算 (batch=32, seq_len=128)
-    B, N, D, D_FF = 32, 128, 256, 1024
-    qkv_flops = 2 * B * N * D * (3 * D)     # QKV projection
-    o_flops = 2 * B * N * D * D              # O projection
-    attn_flops = 2 * B * N * N * D * 2       # QK^T + score@V（两次 N×N×D）
-    ffn_flops = 2 * B * N * D * D_FF * 2     # up + down
-    total_flops = qkv_flops + o_flops + attn_flops + ffn_flops
-    print(f"\nForward FLOPs (B={B}, N={N}): {total_flops / 1e9:.2f} GFLOPs")
 ```
 
-### vLLM 中的内存估算逻辑
+### vLLM 中的 KV cache 内存估算
 
-vLLM 在初始化时需要估算模型占多少显存、剩余显存能放多少 KV cache blocks。这段逻辑在 `worker/worker.py` 中：
+vLLM 启动时需要估算模型占多少显存、剩余空间能放多少 KV cache blocks：
 
 ```python
-# vLLM 内存估算的简化版核心逻辑
-# 实际代码在 vllm/worker/worker.py 的 determine_num_available_blocks()
-
-def estimate_kv_cache_memory(
+def estimate_kv_block_memory(
     num_layers: int,
     num_kv_heads: int,  # GQA 时 kv_heads < q_heads
     head_dim: int,
-    block_size: int,     # 每个 block 存多少个 token，默认 16
-    dtype_bytes: int,    # BF16=2, FP8=1
+    block_size: int = 16,  # 每个 block 容纳的 token 数
+    dtype_bytes: int = 2,  # BF16=2, FP8=1
 ) -> int:
-    """单个 KV cache block 的内存 (bytes)。
-    
-    每个 block 要存：
-    - 每层的 K 和 V（所以 ×2）
-    - 每个 head 的 head_dim 个数值
-    - block_size 个 token
-    """
-    return (2 * num_layers * num_kv_heads * head_dim 
-            * block_size * dtype_bytes)
+    """单个 KV cache block 的内存 (bytes)。"""
+    # K 和 V 各一份（×2），每层、每个 head、block_size 个 token
+    return 2 * num_layers * num_kv_heads * head_dim * block_size * dtype_bytes
 
-# 举例：LLaMA-2 7B
-# 32 layers, 32 kv_heads, head_dim=128, block_size=16, BF16
-block_mem = estimate_kv_cache_memory(32, 32, 128, 16, 2)
-print(f"单个 KV block 内存: {block_mem / 1024:.1f} KB")  # 4096 KB = 4 MB
+# LLaMA-2 7B: 32 layers, 32 kv_heads, head_dim=128, block_size=16, BF16
+block_mem = estimate_kv_block_memory(32, 32, 128, 16, 2)
+print(f"单个 KV block: {block_mem / 1024:.1f} KB")  # 4096 KB = 4 MB
 
-# A100 80GB，模型本身 ~14GB (7B × 2B)
-# 剩余 ~66GB 给 KV cache
-# 能放 66 * 1024 / 4 ≈ 16896 个 blocks
+# A100 80GB，模型 ~14GB (7B × 2B)
+# 剩余 ~66GB 可用于 KV cache
+# 可放 66 * 1024 / 4 ≈ 16896 个 blocks
 # 每个 block 16 tokens → 最多缓存 ~270K tokens
-# 对 batch_size=256, seq_len=1024 来说是够的
 ```
 
-这里体现了一个重要的工程 pattern：**先做粗估算，再实际 profile**。vLLM 的做法是先按公式估一个上界，然后用一个 dummy forward pass 来测量实际占用，取两者的保守值。
+实际 vLLM 的做法是先按公式粗估，再用一个 dummy forward pass 实测，取保守值。
 
-### PyTorch 混合精度训练 Pattern
+### PyTorch 混合精度训练
 
 ```python
-# 标准混合精度训练写法（PyTorch native）
-# 来自 PyTorch 官方文档和各开源项目的通用 pattern
-
 from torch.amp import autocast, GradScaler
 
 model = model.cuda()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-scaler = GradScaler()  # 仅 FP16 需要，BF16 不需要
+scaler = GradScaler()  # 仅 FP16 需要
 
 for batch in dataloader:
     optimizer.zero_grad()
     
-    # autocast 区域内，matmul 等算子自动用低精度执行
-    # 但 softmax、layernorm、loss 会保持 FP32
+    # autocast 区域内 matmul 自动用 BF16
+    # softmax、layernorm、loss 保持 FP32
     with autocast(device_type="cuda", dtype=torch.bfloat16):
         loss = model(batch)
     
-    # BF16 时可以直接 loss.backward()，不需要 scaler
-    # FP16 时必须 scaler.scale(loss).backward()
+    # BF16 可直接 backward，不需要 scaler
     loss.backward()
-    
-    # 梯度裁剪 —— 大模型训练必备
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    
     optimizer.step()
 ```
 
-为什么 BF16 不需要 GradScaler？因为 BF16 的动态范围跟 FP32 一样，梯度不会 underflow。FP16 的动态范围小，微小的梯度值会 flush 到 0，所以需要 loss scaling 把梯度数值抬上去。
+BF16 不需要 `GradScaler` 的原因：BF16 动态范围与 FP32 一致，梯度不会 underflow。FP16 动态范围小，微小梯度值会被 flush 为 0，因此必须用 loss scaling 抬高数值范围。
 
 ---
 
@@ -606,19 +580,19 @@ for batch in dataloader:
 
 ### vLLM
 
-vLLM 的设计处处对应本讲的分析：
+vLLM 的设计与本讲的分析一一对应：
 
-**PagedAttention**——OS 虚拟内存的思想用到 KV cache 上。传统实现为每个序列预分配一块连续内存（按 max_seq_len），实际用不满就浪费了。PagedAttention 把 KV cache 切成固定大小的 block（默认 16 tokens/block），按需分配，不连续也没关系。这把 KV cache 的内存利用率从 ~60% 提到 ~95%+。
+**PagedAttention** —— 借鉴 OS 虚拟内存思想管理 KV cache。传统做法为每个序列按 `max_seq_len` 预分配连续内存，实际利用率低。PagedAttention 将 KV cache 切成固定大小的 block（默认 16 tokens/block），按需分配且无需连续。内存利用率从约 60% 提升到 95%+。
 
-**Continuous Batching**——不等一个 batch 里所有序列都生成完才开始下一个 batch，而是序列完成就立刻填入新请求。本质是在 compute-bound（prefill）和 memory-bound（decode）之间动态调度。
+**Continuous Batching** —— 不等一个 batch 里所有序列生成完毕再处理下一个 batch，而是序列完成即填入新请求。本质是在 compute-bound（prefill）和 memory-bound（decode）之间动态调度。
 
 ### TensorRT-LLM
 
-NVIDIA 的编译器从 FLOPs 和 memory access 分析出发做优化：
+NVIDIA 的推理编译器从计算量和访存分析出发做优化：
 
-**Layer Fusion**——把 element-wise ops（bias add、activation、residual add）融合进前面的 matmul kernel，减少中间结果的 HBM 读写。一个被 fuse 掉的 op 意味着少一次 HBM round trip，在 memory-bound 的场景下收益很大。
+**Layer Fusion** —— 将 element-wise ops（bias add、activation、residual add）融合进前序 matmul kernel，减少中间结果的 HBM 读写。每个被融合的 op 意味着少一次 HBM round trip，在 memory-bound 场景下收益显著。
 
-**GEMM Plugin**——根据矩阵的具体尺寸选 tiling 策略，让数据搬运和计算 overlap。不同 shape 的最优策略不同，所以 TRT-LLM 会在构建阶段做 auto-tuning。
+**GEMM Plugin** —— 根据矩阵具体尺寸选择 tiling 策略，让数据搬运与计算 overlap。不同 shape 的最优策略不同，因此 TRT-LLM 在构建阶段做 auto-tuning。
 
 ---
 
@@ -627,10 +601,10 @@ NVIDIA 的编译器从 FLOPs 和 memory access 分析出发做优化：
 | 方向 | Lecture | 关联点 |
 |------|---------|--------|
 | ← 前置 | Lec01 | 效率优化的动机与全局视角 |
-| → | Lec03/04 | 剪枝——直接减参数量和 FLOPs，本讲公式是衡量标准 |
+| → | Lec03/04 | 剪枝——直接减参数量和计算量，本讲公式是衡量标准 |
 | → | Lec05/06 | 量化——降低每个参数的 bit 数，本讲的精度格式分析是基础 |
 | → | Lec11 | Tiny Engine——MCU 上的极限内存约束，本讲的内存分析方法论直接沿用 |
-| → | Lec12/13 | Transformer/LLM 部署——本讲所有公式的大规模实际应用 |
+| → | Lec12/13 | Transformer / LLM 部署——本讲所有公式的大规模实际应用 |
 
 ---
 
@@ -638,47 +612,50 @@ NVIDIA 的编译器从 FLOPs 和 memory access 分析出发做优化：
 
 **Q1：Linear(1024, 4096) 有多少参数？FP16 推理占多少内存？**
 
-参数量 = 1024 × 4096 + 4096(bias) = 4,198,400 ≈ 4.2M。FP16 每参数 2 bytes → 4.2M × 2 = **8.4 MB**。
+参数量 $= 1024 \times 4096 + 4096 = 4{,}198{,}400 \approx 4.2\text{M}$。FP16 每参数 2 bytes → $4.2\text{M} \times 2 = 8.4 \text{ MB}$。
 
-注意：很多现代模型 bias=False（LLaMA、Mistral 都是），这时参数量 = 4,194,304，内存 ≈ 8.0 MB。面试时可以主动提这一点，展示你知道当前的工程实践。
+补充：现代模型多设 bias=False（LLaMA、Mistral 等），此时参数量 $= 4{,}194{,}304$，内存 $\approx 8.0 \text{ MB}$。
 
 ---
 
-**Q2：FLOPs 和参数量能脱钩吗？举例。**
+**Q2：参数量和计算量能脱钩吗？举例。**
 
-典型例子：`Conv2d(3, 3, 3)` 只有 81 个参数，但作用在 1000×1000 图像上 FLOPs ≈ 162M。原因就是 weight sharing——同一组参数在不同空间位置反复使用。反过来，Embedding 层参数量巨大（vocab_size × d_model），但 FLOPs 几乎为零（只是查表）。
+可以，而且很常见。
+
+- `Conv2d(3, 3, 3)` 只有 81 个参数，作用在 $1000 \times 1000$ 图像上 MACs $\approx 81\text{M}$。原因：weight sharing 在空间维度反复使用同一组参数。
+- Embedding 层参数量巨大（$\text{vocab\_size} \times d_{\text{model}}$），但 MACs 几乎为零——仅做一次 gather 查表。
 
 ---
 
 **Q3：BF16 vs FP16，为什么 LLM 训练选 BF16？**
 
 两个原因：
-1. 动态范围——BF16 指数 8 bit（同 FP32），最大值 ~3.4×10³⁸。FP16 指数 5 bit，最大值 65504。训练中 attention score 或 loss 超过 65504 就溢出为 inf。BF16 不需要 loss scaling，FP16 必须。
-2. 转换简单——FP32 到 BF16 截断低 16 位即可，硬件实现几乎零开销。
+1. **动态范围** —— BF16 指数 8 bit（与 FP32 一致），最大值 $\sim 3.4 \times 10^{38}$。FP16 指数 5 bit，最大值 65504。训练中 attention score 或 loss 超过 65504 即溢出。BF16 不需要 loss scaling，FP16 必须。
+2. **转换简单** —— FP32 转 BF16 截断低 16 位即可，硬件几乎零开销。
 
-代价是 BF16 尾数只有 7 bit（FP16 有 10 bit），精度更低，但实际训练不敏感。
+代价是 BF16 尾数仅 7 bit（FP16 有 10 bit），精度更低，但对训练收敛影响可忽略。
 
 ---
 
 **Q4：LLM decode 为什么是 memory-bound？怎么缓解？**
 
-Decode 时每个 step 只生成一个 token（或很少几个），矩阵乘退化为矩阵-向量乘。每个参数读 2 bytes（FP16），做 2 FLOPs，arithmetic intensity ≈ 1，远低于 GPU 的 compute/bandwidth 比（A100 约 156）。算力大量空转。
+Decode 时每步只生成一个 token（或极少量），矩阵乘退化为矩阵-向量乘。每个参数读 2 bytes（FP16），做 2 FLOPs，arithmetic intensity $\approx 1$，远低于 A100 的 ridge point（约 156）。算力大量空闲。
 
 缓解方法：
-- Continuous batching——攒多个请求一起 decode，提高 batch size 从而提高 AI
-- 模型量化——INT8/INT4 减少搬运量
-- Speculative decoding——用小模型快速猜多个 token，大模型一次性验证
+- **Continuous batching** —— 攒多请求一起 decode，提高 batch size 从而提升 AI
+- **模型量化** —— INT8 / INT4 减少搬运量
+- **Speculative decoding** —— 小模型快速草拟多个 token，大模型一次验证
 
 ---
 
 **Q5：推理内存 = 参数 × dtype_bytes 吗？少了什么？**
 
-少了 **KV cache**。每生成一个新 token，前面所有 token 的 K、V 向量都要保留（否则每步重算，延迟不可接受）。KV cache 大小：
+少了 **KV cache**。自回归生成时必须保留已生成所有 token 的 K、V 向量：
 
-```
-KV_cache = 2 × num_layers × num_kv_heads × head_dim × seq_len × batch_size × dtype_bytes
-```
+$$
+\text{KV\_cache} = 2 \times L \times n_{\text{kv\_heads}} \times d_{\text{head}} \times N \times B \times \text{dtype\_bytes}
+$$
 
-长序列、大 batch 下 KV cache 可以超过模型权重本身。LLaMA-2 7B 处理 batch=128, seq=4096 的 KV cache 约 64 GB，远超 14 GB 的模型权重。
+长序列 + 大 batch 下 KV cache 可远超模型权重。LLaMA-2 7B 在 batch=128、seq=4096 下 KV cache 约 64 GB，模型权重仅 14 GB。
 
-这就是 PagedAttention、GQA（Grouped Query Attention）、MQA（Multi Query Attention）等技术的出发点——压缩 KV cache。
+这正是 PagedAttention、GQA（Grouped Query Attention）、MQA（Multi Query Attention）等技术的出发点——压缩 KV cache。
