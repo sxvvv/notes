@@ -1,575 +1,352 @@
-# Lec03 神经网络剪枝基础 (Pruning I)
+# Lecture 03 · 神经网络剪枝基础 — Pruning & Sparsity (Part I)
 
-> 📺 [课程视频](https://www.youtube.com/watch?v=sZzc6tAtTrM) | 📄 [Slides](https://hanlab.mit.edu/courses/2023-fall-65940)
+> **课程**: MIT 6.5940 TinyML and Efficient Deep Learning Computing  
+> **笔记整理**: 基于课程 slides 和讲义  
+> **核心关键词**: Pruning, Sparsity, Magnitude Pruning, SNIP, OBD, Structured/Unstructured, 2:4 Sparsity
 
 ---
 
-## 核心概念
+## 写在前面：为什么要聊剪枝？
 
-### 3.1 剪枝动机与直觉
+过去几年，模型的参数量以近乎指数级的速度膨胀——从 2017 年 Transformer 的 50M 参数，到 GPT-3 的 175B，再到 MT-NLG 的 530B。与此同时，单块 GPU 的显存增长远远跟不上这个节奏。这中间的鸿沟，就是模型压缩技术存在的根本意义。
 
-神经网络在训练时往往是**过参数化**的 (over-parameterized)。直觉上，我们需要大量参数来让优化过程顺利收敛（loss landscape 更平滑，更容易找到好的极小值），但推理时不需要那么多参数就能保持精度。
+而剪枝（pruning），是最直觉、最经典的压缩手段之一。一句话概括：**训练时我们需要足够多的参数让优化找到好的解，但推理时不需要那么多参数就能保持住精度**。这跟人脑的发育惊人地相似——婴幼儿大脑的突触数量在 2-4 岁时达到峰值（约 15000 个/神经元），此后经历大规模"突触修剪"，成年后只剩约 7000 个/神经元，但认知能力反而更强。
 
-几个关键观察：
+Song Han 在 NeurIPS 2015 的工作 *"Learning Both Weights and Connections"* 是现代深度学习剪枝的里程碑——AlexNet 的参数从 61M 压缩到 6.7M（9×），VGG-16 从 138M 压缩到 10.3M（12×），精度几乎无损。此后关于剪枝的研究论文数量从每年不到 100 篇，飙升到 2022 年的超过 3000 篇。
 
-1. **权重分布往往接近零**：训练好的网络里，权重的分布通常是以 0 为中心的钟形分布。绝对值很小的权重对输出影响有限。
-2. **激活稀疏性**：ReLU 激活函数会直接把负值置零。统计表明 AlexNet 在 ImageNet 上的激活稀疏度高达 62%。
-3. **冗余特征**：不同 filter 可能学到相似的特征，存在大量冗余。
+![Network Compression Results](images/fig6_compression_results.png)
 
-**剪枝 vs 量化的本质区别**：
-- **量化**：改变权重的数值精度（float32 → int8），结构不变，参数数量不变
-- **剪枝**：改变网络结构，直接删除权重/神经元/层，参数数量减少
+MLPerf 的 Open Division 也印证了这一点：在 BERT Large 上，通过 **剪枝 + 蒸馏 + 量化** 的组合拳，模型尺寸从 607MB 降到 177MB，推理吞吐提升 4.5×，精度仍保持在 99% 以上。
 
-两者可以组合使用（先剪枝再量化，或同时做）。
+---
 
-### 3.2 剪枝粒度 (Pruning Granularity)
+## 1. 剪枝的核心直觉
 
-剪枝粒度是一个谱系，从最细到最粗：
+### 1.1 为什么剪枝能 work？
 
-```
-weight → vector → kernel → channel → filter → layer → block
-  细 ←————————————————————————————————————————————→ 粗
-  灵活 ←—————————————————————————————————————→ 硬件友好
-```
+有三个经验性观察支撑着剪枝的有效性：
 
-#### 非结构化剪枝 (Unstructured Pruning)
+**观察一：权重分布天然接近零。** 训练收敛后的权重分布通常是以 0 为中心的钟形分布（下图），大量权重的绝对值很小，对网络输出的贡献微乎其微。把这些"几乎是零"的权重直接抹掉，输出几乎不变。
 
-最细粒度，逐个权重决定是否删除。对于权重矩阵 $W \in \mathbb{R}^{m \times n}$，产生一个二值掩码 $M \in \{0, 1\}^{m \times n}$：
+![Weight Distribution Before and After Pruning](images/fig1_weight_distribution.png)
 
-$$\hat{W} = W \odot M$$
+**观察二：激活天然稀疏。** ReLU 激活函数会将所有负值置零。实测 AlexNet 在 ImageNet 上的激活稀疏度高达 62%——超过一半的神经元在任意给定输入下都是"沉默"的。
 
-其中 $\odot$ 是逐元素乘法（Hadamard product）。
+**观察三：特征冗余。** 不同 filter 经常学到高度相似的特征模式，存在大量功能重叠。
 
-**优点**：
-- 剪枝灵活度最高，可以精确控制每个权重
-- 精度损失最小（在相同稀疏度下）
+### 1.2 剪枝 vs 量化
 
-**缺点**：
-- 产生**不规则稀疏矩阵**，无法直接用标准 BLAS 库加速
-- 内存访问模式随机，cache miss 率高
-- 需要专门的稀疏计算库（如 cuSPARSE）或专用硬件
+很多人容易混淆这两者。区别其实很简单：
 
-#### 结构化剪枝 (Structured Pruning)
+| 维度 | 剪枝 (Pruning) | 量化 (Quantization) |
+|------|----------------|---------------------|
+| **做了什么** | 删除权重/结构 | 降低数值精度 |
+| **网络结构** | 变了（变稀疏或变小） | 不变 |
+| **参数数量** | 减少 | 不变（但每个参数的存储位宽变小） |
+| **核心矛盾** | 删多少 vs 精度损失 | 位宽多低 vs 精度损失 |
 
-按照规则结构删除，保持矩阵的规则性。
+两者可以且经常组合使用。MLPerf 的 BERT 提交就是先剪枝、再蒸馏、最后量化。
 
-**细粒度结构化**：
+### 1.3 形式化定义
 
-- **Pattern-based**：每个 kernel 按固定 pattern 剪枝，例如十字形、对角线形
-- **Vector-level**：按向量（行或列）剪枝
-- **Kernel-level**：删整个卷积核（$k \times k$），输入通道和输出通道连接的一个 kernel 块
+给定原始网络权重 $W$，剪枝本质上是在解一个带约束的优化问题：
 
-**粗粒度结构化**：
+$$\arg\min_{W_P} \mathcal{L}(x; W_P) \quad \text{s.t.} \quad \|W_P\|_0 \leq N$$
 
-- **Channel-level**：删整个输入/输出 channel。卷积层的 channel 数从 $C_{in}$ 减小
-- **Filter-level**：删整个 filter（所有输入 channel 对应一个输出 channel 的所有 kernel）
-- **Layer-level**：直接删整个层
+其中 $\|W_P\|_0$ 是非零权重的数量，$N$ 是我们期望保留的参数预算。这是一个 NP-hard 的组合优化问题，实际中只能用各种启发式方法近似求解。
 
-**结构化剪枝的优点**：
-- 剪枝后模型仍然是稠密矩阵，可以直接用标准 cuBLAS/cuDNN 加速
-- 普通 GPU 无需任何特殊库支持
-- 模型可以无损地序列化为更小的网络
+---
 
-**结构化剪枝的缺点**：
-- 精度损失通常比非结构化剪枝大（约束更强）
-- 要达到同等精度，需要的稀疏度（sparsity）更低
+## 2. 剪枝粒度：从哪个维度下刀？
 
-#### Channel 剪枝的参数量计算
+剪枝粒度决定了"我们以什么样的 pattern 去删除权重"。这是一个在**灵活性**（越细粒度，可选择的自由度越高，精度保持越好）和**硬件友好性**（越粗粒度，越容易在 GPU 上加速）之间的 trade-off。
 
-对于一个卷积层，参数量为：
-$$\text{Params} = C_{out} \times C_{in} \times k_H \times k_W$$
+![Granularity Spectrum](images/fig3_granularity_spectrum.png)
 
-剪掉 $p$ 个输出 channel 后：
+### 2.1 非结构化剪枝（Unstructured / Fine-grained）
+
+最细的粒度，逐个权重独立决定保留或删除。对于权重矩阵 $W \in \mathbb{R}^{m \times n}$，生成一个同形状的二值掩码：
+
+$$\hat{W} = W \odot M, \quad M \in \{0, 1\}^{m \times n}$$
+
+**好处**：自由度最高，同等稀疏度下精度损失最小。在 Han et al. 2015 的实验中，AlexNet 可以剪掉约 89% 的参数而精度几乎不变。
+
+**坏处**：产生不规则稀疏矩阵。GPU 上的 cuBLAS 是为稠密矩阵乘法优化的，面对随机的稀疏 pattern 无法高效利用——你删了 90% 的权重，但可能只获得 10% 的实际加速，甚至更慢（因为 cache miss）。需要专门的稀疏硬件或库才能真正受益。
+
+### 2.2 N:M 结构化稀疏（Pattern-based）
+
+NVIDIA 在 Ampere 架构（A100）中引入的 **2:4 稀疏** 是一个非常实用的折中方案。规则很简单：每连续 4 个权重中，必须恰好有 2 个为零。这意味着固定 50% 的稀疏度。
+
+![2:4 Sparsity Pattern](images/fig7_2_4_sparsity.png)
+
+A100 的 Sparse Tensor Core 可以直接处理这种 pattern，实现**近 2× 的 matmul 加速**。而且在各种任务上的精度损失极小（ResNet-50: 76.1 → 76.2, BERT-Large SQuAD F1: 91.9 → 91.9）。
+
+这是目前工业界最务实的非结构化剪枝方案。
+
+### 2.3 通道级剪枝（Channel Pruning）
+
+最粗的实用粒度。直接删除整个输出 channel（等价于删除一个 filter 的所有权重）。
+
+一个卷积层的参数量为 $C_{out} \times C_{in} \times k_H \times k_W$。剪掉 $p$ 个输出 channel 后：
+
 $$\text{Params}' = (C_{out} - p) \times C_{in} \times k_H \times k_W$$
 
-同时，下一层的输入 channel 也需要对应减少，级联减参效果明显。
+同时，下一层的输入 channel 也自动减少 $p$，产生**级联减参效果**。
 
-### 3.3 剪枝准则 (Pruning Criterion)
+**核心优势**：剪枝后的网络就是一个完整的、更小的稠密网络，直接用普通 cuBLAS 就能加速，无需任何稀疏库支持。
 
-如何判断哪些权重"不重要"？这是剪枝的核心问题。
+**主要劣势**：约束太强，同等参数压缩比下精度损失通常大于非结构化剪枝。
 
-#### Magnitude-based 准则（幅度剪枝）
+He et al. (ECCV 2018) 的 AMC 工作表明，**非均匀的通道剪枝**（不同层分配不同的剪枝率）显著优于简单地将所有层的 channel 数同比缩小。
 
-最直观的方法：绝对值越小越不重要。
+### 2.4 怎么选？
 
-**L1-norm 准则**（逐权重）：
-$$\text{score}(w_{ij}) = |w_{ij}|$$
+实际工程中的选择逻辑：
 
-**L2-norm 准则**（按 filter/channel）：
-$$\text{score}(\mathbf{f}_j) = \|\mathbf{f}_j\|_2 = \sqrt{\sum_{i,k,l} w_{ijkl}^2}$$
-
-**L1-norm 按 filter**：
-$$\text{score}(\mathbf{f}_j) = \|\mathbf{f}_j\|_1 = \sum_{i,k,l} |w_{ijkl}|$$
-
-**优点**：计算简单，不需要数据，训练完直接用  
-**缺点**：忽略了权重之间的相关性，忽略了激活分布
-
-#### Saliency-based 准则（显著性剪枝）
-
-考虑删掉某个权重对 loss 的影响。
-
-**一阶 Taylor 展开**：
-
-设当前权重为 $w$，删除该权重等价于 $\Delta w = -w$，loss 变化为：
-
-$$\Delta \mathcal{L} \approx \frac{\partial \mathcal{L}}{\partial w} \cdot (-w) = -\frac{\partial \mathcal{L}}{\partial w} \cdot w$$
-
-权重的重要性定义为 loss 变化的绝对值：
-
-$$\text{saliency}(w) = \left| \frac{\partial \mathcal{L}}{\partial w} \cdot w \right|$$
-
-这就是 **SNIP (Single-shot Network Pruning)** 的核心：
-
-$$s_j = \left| \frac{\partial \mathcal{L}(\mathbf{w}; \mathcal{D})}{\partial w_j} \cdot w_j \right|$$
-
-**优势**：同时考虑了权重大小 $|w|$ 和梯度大小 $|\partial \mathcal{L}/\partial w|$，一个权重大但梯度小（loss 对它不敏感），也可以剪掉。
-
-#### 二阶 Taylor 展开（Optimal Brain Damage / Surgeon）
-
-更精确的估计，包含曲率信息。
-
-$$\Delta \mathcal{L} \approx \frac{\partial \mathcal{L}}{\partial w} \Delta w + \frac{1}{2} \Delta w^T H \Delta w$$
-
-其中 $H = \frac{\partial^2 \mathcal{L}}{\partial w^2}$ 是 Hessian 矩阵。
-
-假设在局部最优点 $\frac{\partial \mathcal{L}}{\partial w} = 0$，且只删单个权重 $w_i$（即 $\Delta w = -w_i \mathbf{e}_i$）：
-
-$$\Delta \mathcal{L}_i \approx \frac{1}{2} \frac{w_i^2}{[H^{-1}]_{ii}}$$
-
-**OBD (Optimal Brain Damage)**：假设 Hessian 是对角矩阵，只用对角元素：
-$$\text{saliency}_{\text{OBD}}(w_i) = \frac{1}{2} h_{ii} w_i^2$$
-
-**OBS (Optimal Brain Surgeon)**：使用完整 Hessian 逆，不需要假设对角：
-$$\delta w^* = -\frac{w_i}{[H^{-1}]_{ii}} H^{-1} \mathbf{e}_i$$
-
-OBS 同时给出最优的权重更新方向（其他权重如何补偿这个删除）。
-
-#### APoZ (Average Percentage of Zeros)
-
-基于激活稀疏性的准则。对一批数据前向传播，统计每个 channel 的激活有多少比例为 0：
-
-$$\text{APoZ}(c) = \frac{1}{N \cdot H \cdot W} \sum_{n, h, w} \mathbf{1}[\text{ReLU}(\mathbf{z}_{n,c,h,w}) = 0]$$
-
-APoZ 越高 → 该 channel 的激活大部分是 0 → 该 channel 可以删掉。
-
-#### Reconstruction Error 最小化
-
-删除权重后，尽量让下一层的输入分布不变。设第 $l$ 层输出为 $\mathbf{y}^{(l)}$，剪枝后的输出为 $\hat{\mathbf{y}}^{(l)}$：
-
-$$\min_{M} \|\mathbf{y}^{(l)} - \hat{\mathbf{y}}^{(l)}\|_2^2 \quad \text{s.t.} \|M\|_0 \leq k$$
-
-即在给定稀疏度约束下，最小化特征重建误差。这个方法需要数据，但通常精度比 magnitude pruning 好。
-
-### 3.4 剪枝流程
-
-#### 标准流程：训练-剪枝-微调
-
-```
-预训练 → 剪枝（按准则去掉权重）→ 微调（恢复精度）
-```
-
-微调的必要性：剪枝后模型精度下降，需要在小学习率下继续训练来恢复。微调通常比从头训练快很多。
-
-#### 迭代剪枝 (Iterative Pruning)
-
-每次剪掉一小部分，微调恢复，再继续剪：
-
-```
-训练 → [剪10% → 微调 → 剪10% → 微调 → ...]直到目标稀疏度
-```
-
-**优点**：比一次性剪到目标稀疏度精度更好（每次剪枝量小，模型有时间自适应）  
-**缺点**：训练开销大，每一轮都需要微调
-
-#### 一次性剪枝 (One-shot Pruning)
-
-直接剪到目标稀疏度，然后微调一次。计算开销小，但精度可能略差。
-
-#### 全局剪枝 vs 局部剪枝
-
-- **局部 (Layer-wise)**：每层独立设定剪枝率，例如每层都剪 30%
-- **全局 (Global)**：设全局阈值，所有层共享同一个评分排名，有些层可能剪很多，有些层几乎不剪
-
-全局剪枝更灵活，因为不同层对精度的敏感度不同（第一层和最后一层通常更敏感）。
+- **通用 GPU（无稀疏支持）** → 通道级剪枝，直出更小网络
+- **NVIDIA Ampere / Hopper GPU** → 2:4 结构化稀疏，几乎免费拿 2× 加速
+- **自研 ASIC / FPGA** → 非结构化剪枝，充分利用稀疏加速硬件
+- **国产 GPU（如沐曦 MACA）** → 目前稀疏支持不成熟，优先通道级剪枝
 
 ---
 
-## 数学推导
+## 3. 剪枝准则：删谁？
 
-### 推导 1：L1 Filter Pruning 的 FLOPs 减少量
+确定了"以什么粒度删"之后，下一个核心问题是"删谁"——也就是如何定义权重的重要性。
 
-设原始卷积层：输入 $(C_{in}, H, W)$，输出 $(C_{out}, H', W')$，kernel size $k \times k$。
+![Pruning Criteria Comparison](images/fig4_pruning_criteria.png)
 
-FLOPs（乘加操作数）：
-$$\text{FLOPs} = C_{out} \times C_{in} \times k^2 \times H' \times W' \times 2$$
+### 3.1 幅度剪枝（Magnitude-based）
 
-（每个输出元素需要 $C_{in} \times k^2$ 次乘加，共 $C_{out} \times H' \times W'$ 个输出元素，乘 2 是因为乘法和加法各算一次）
+最简单、最广泛使用的准则：**绝对值越小越不重要**。
 
-剪掉 $m$ 个 filter（输出 channel）后：
-$$\text{FLOPs}' = (C_{out} - m) \times C_{in} \times k^2 \times H' \times W' \times 2$$
+对于逐权重剪枝：$\text{Importance}(w_i) = |w_i|$
 
-FLOPs 减少比例：
-$$\frac{\text{FLOPs} - \text{FLOPs}'}{\text{FLOPs}} = \frac{m}{C_{out}}$$
+对于结构化剪枝（如按 filter 剪），可以用 L1 或 L2 范数：
 
-即剪枝率直接等于 FLOPs 减少比例（对于这一层）。
+$$\text{L1-norm}: \|\mathbf{f}\|_1 = \sum_{i} |w_i|, \quad \text{L2-norm}: \|\mathbf{f}\|_2 = \sqrt{\sum_{i} w_i^2}$$
 
-### 推导 2：SNIP Saliency 推导
+举个简单例子。假设有权重矩阵 $W = \begin{bmatrix} 3 & -2 \\ 1 & -5 \end{bmatrix}$，做 element-wise L1 magnitude pruning，保留 50%：重要性分别为 3, 2, 1, 5，删掉最小的两个（2 和 1），得到 $\begin{bmatrix} 3 & 0 \\ 0 & -5 \end{bmatrix}$。
 
-设网络参数为 $\mathbf{w}$，数据集为 $\mathcal{D}$，损失函数为 $\mathcal{L}(\mathbf{w}; \mathcal{D})$。
+**优点**：实现极其简单，不需要数据，训练完直接用。
 
-引入掩码 $\mathbf{c} \in \{0, 1\}^{|\mathbf{w}|}$，修改后的损失为：
+**缺点**：完全忽略了权重对 loss 的实际影响。一个权重绝对值大不代表它对模型输出真的重要——如果 loss 对它的梯度接近零，删掉它几乎不影响精度。
 
-$$\mathcal{L}(c \odot \mathbf{w}; \mathcal{D})$$
+### 3.2 基于显著性的剪枝（Saliency-based）
 
-对 $c_j$ 的影响：令 $\delta c_j = c_j - 1$（从保留到删除的变化），一阶近似：
+这一族方法的核心思想是：不看权重本身的大小，而看**删掉它之后 loss 变化多少**。
 
-$$\Delta \mathcal{L} \approx \frac{\partial \mathcal{L}(c \odot \mathbf{w}; \mathcal{D})}{\partial c_j} \Bigg|_{c=\mathbf{1}} \cdot \delta c_j$$
+**SNIP（Single-shot Network Pruning）** 用一阶 Taylor 展开来近似：
 
-计算偏导数（链式法则）：
+引入掩码 $c_j \in \{0, 1\}$，令 $\delta c_j = c_j - 1$（从保留到删除），则：
 
-$$\frac{\partial \mathcal{L}(c \odot \mathbf{w}; \mathcal{D})}{\partial c_j} \Bigg|_{c=\mathbf{1}} = \frac{\partial \mathcal{L}(\mathbf{w}; \mathcal{D})}{\partial w_j} \cdot w_j$$
+$$\Delta \mathcal{L} \approx \frac{\partial \mathcal{L}(c \odot w)}{\partial c_j}\bigg|_{c=\mathbf{1}} \cdot \delta c_j$$
 
-因此 saliency 定义为对 loss 影响的绝对值：
+由链式法则，$\frac{\partial \mathcal{L}(c \odot w)}{\partial c_j}\big|_{c=\mathbf{1}} = \frac{\partial \mathcal{L}}{\partial w_j} \cdot w_j$，因此：
 
-$$s_j = \left| \frac{\partial \mathcal{L}(\mathbf{w}; \mathcal{D})}{\partial w_j} \cdot w_j \right|$$
+$$s_j = \left| \frac{\partial \mathcal{L}}{\partial w_j} \cdot w_j \right|$$
 
-**注意**：这只需要做一次前向+反向传播，计算开销是 $O(|\mathbf{w}|)$，和梯度计算一样高效。
+这个公式的物理意义非常清楚：**重要性 = 梯度大小 × 权重大小**。它同时考虑了两个因素——一个权重大但梯度小（loss 对它不敏感），saliency 也会小。
 
-### 推导 3：全局阈值的推导
+实现上，只需一次前向 + 反向传播就能算完所有权重的 saliency，计算开销跟算一次梯度一样。
 
-给定目标稀疏度 $s$（比如保留 30% 的权重），全局阈值 $\tau$ 满足：
+### 3.3 二阶方法：OBD 与 OBS
 
-$$\tau = \text{quantile}_{1-s}\left(\{|w| : w \in \mathbf{W}\}\right)$$
+如果一阶近似不够精确，可以进一步引入 Hessian（二阶导数）信息。
 
-即找到所有权重绝对值的第 $(1-s)$ 百分位数。掩码为：
+**Optimal Brain Damage (OBD)**，LeCun et al. 1989：
 
-$$M_{ij} = \mathbf{1}[|w_{ij}| \geq \tau]$$
+$$\Delta \mathcal{L} \approx \sum_i g_i \delta w_i + \frac{1}{2}\sum_i h_{ii}\delta w_i^2 + \frac{1}{2}\sum_{i \neq j} h_{ij}\delta w_i \delta w_j + O(\|\delta W\|^3)$$
+
+OBD 做了三个假设来简化：(1) 训练已收敛（一阶项 ≈ 0），(2) 高阶项忽略，(3) Hessian 是对角矩阵（交叉项忽略）。最终：
+
+$$\text{Importance}(w_i) = \frac{1}{2} h_{ii} w_i^2$$
+
+**Optimal Brain Surgeon (OBS)** 放松了对角假设，使用完整 Hessian 逆，同时给出删除某个权重后其余权重应该如何补偿调整。理论上更精确，但计算 Hessian 逆的开销 $O(n^2)$ 到 $O(n^3)$ 对现代大模型来说不太现实。
+
+### 3.4 基于激活的准则：APoZ
+
+从权重视角转向激活视角。对一批数据做前向传播，统计每个 channel 的激活中有多少比例为零：
+
+$$\text{APoZ}(c) = \frac{1}{N \cdot H \cdot W} \sum_{n,h,w} \mathbb{1}[\text{ReLU}(z_{n,c,h,w}) = 0]$$
+
+APoZ 越高 → 这个 channel 大部分时间都在"睡觉" → 可以安全删除。
+
+这个准则需要数据（至少一个 batch），但非常直觉，特别适合做 channel pruning。
+
+### 3.5 基于重建误差的准则
+
+不是从全局 loss 出发，而是**逐层最小化特征重建误差**。设第 $l$ 层输出为 $Z = XW^T$，在通道维度引入选择向量 $\beta$：
+
+$$\arg\min_{W, \beta} \left\| Z - \sum_{c=0}^{C_{in}-1} \beta_c X_c W_c^T \right\|_F^2, \quad \text{s.t.} \quad \|\beta\|_0 \leq N_c$$
+
+$\beta_c = 0$ 表示第 $c$ 个输入通道被剪掉。通过交替优化（固定 $W$ 解 $\beta$，固定 $\beta$ 解 $W$），可以找到对下游特征影响最小的剪枝方案。
+
+### 3.6 准则对比小结
+
+| 准则 | 核心公式 | 需要数据？ | 需要梯度？ | 计算开销 | 精度表现 |
+|------|---------|-----------|-----------|---------|---------|
+| Magnitude | $\|w\|_p$ | 否 | 否 | 极低 | 基线 |
+| SNIP | $\|g \cdot w\|$ | 是（1 batch） | 是（1次） | 低 | 优于 magnitude |
+| OBD | $\frac{1}{2}h_{ii}w_i^2$ | 是 | 是（二阶） | 高 | 更优 |
+| APoZ | 零激活占比 | 是 | 否 | 中等 | 适合 channel pruning |
+| Reconstruction | $\min\|Z - \hat{Z}\|_F^2$ | 是 | 否 | 中等 | 较优 |
 
 ---
 
-## 代码示例
+## 4. 剪枝流程与策略
+
+### 4.1 基本流程
+
+标准的剪枝流程是三步走：
+
+1. **预训练**：正常训练一个大模型至收敛
+2. **剪枝**：按某种准则删除权重
+3. **微调**：用较小学习率继续训练，恢复精度
+
+微调是必不可少的——剪枝打破了网络层间的协作关系，需要让剩余权重重新适应新的网络结构。学习率通常设为原始训练的 1/10 到 1/100，微调 10-20% 的原始 epoch 数即可。
+
+### 4.2 一次剪 vs 分多次剪
+
+![Sparsity-Accuracy Tradeoff](images/fig2_sparsity_accuracy.png)
+
+上图清楚地展示了三种策略的差异：
+
+**One-shot pruning**（只剪一次，不微调）：稀疏度一高，精度断崖式下跌。
+
+**Pruning + Fine-tuning**（剪一次 + 微调）：精度恢复明显，但在高稀疏度（>80%）下仍有不小损失。
+
+**Iterative Pruning + Fine-tuning**（每次剪一点，每次都微调）：精度保持最好。每一轮中，模型有时间重新分配权重的重要性，后续轮次的剪枝决策更准确。代价是训练总开销正比于迭代次数。
+
+### 4.3 全局剪枝 vs 逐层剪枝
+
+![Global vs Local Pruning](images/fig8_global_vs_local.png)
+
+**逐层剪枝（Local）**：每层独立设一个固定剪枝率，比如每层都剪 50%。简单粗暴，但忽略了不同层对精度的敏感度差异——第一层和最后一层通常更敏感，中间层有更多冗余。
+
+**全局剪枝（Global）**：所有层的权重统一排序，设一个全局阈值 $\tau$：
+
+$$\tau = \text{quantile}_{1-s}(\{|w| : w \in W\})$$
+
+结果是：敏感层自动少剪，冗余层自动多剪，精度通常显著更好。
+
+---
+
+## 5. 硬件与推理框架映射
+
+理论再漂亮，最终得跑在真实硬件上。
+
+### 5.1 NVIDIA 生态
+
+**A100 / H100 的 2:4 稀疏**：原生 Sparse Tensor Core 支持，通过 `cusparseLt` 库实现近 2× matmul 加速。TensorRT-LLM 的 `ModelOpt` 工具链（`nvidia-modelopt`）已经集成了 SparseGPT，可以一键对 LLM 做 2:4 剪枝 + 量化。
+
+### 5.2 vLLM
+
+vLLM 可以加载剪枝后的 HuggingFace 模型。对于非结构化稀疏，vLLM 目前仍用稠密计算（稀疏没有实际加速）。结构化剪枝后如果把 `hidden_dim` 改小保存为新 config，则 vLLM 能直接享受加速。
+
+### 5.3 国产硬件
+
+以沐曦 MACA 为例：稀疏加速库尚不成熟，**结构化剪枝是最务实的选择**。Channel pruning 后模型变小，直接用标准矩阵乘法即可。国产硬件上通常优先做量化（工具链更成熟），剪枝更多作为辅助手段。
+
+---
+
+## 6. 关键数据：Memory Access 的能耗真相
+
+最后聊一个被很多算法研究者忽视的硬件事实——**数据搬运的能耗远远大于计算本身**。
+
+![Energy Cost of Operations](images/fig5_energy_cost.png)
+
+Horowitz (ISSCC 2014) 的经典数据表明：在 45nm 工艺下，一次 32-bit DRAM 读取消耗 640pJ，是一次 32-bit 整数加法（0.1pJ）的 **6400 倍**。这意味着，减少模型大小带来的收益不仅是计算量的减少，更重要的是**内存带宽和能耗的节省**。剪枝压缩了模型体积，直接减少了 DRAM 访问次数，这才是它在边缘设备上的真正价值。
+
+---
+
+## 7. 面试考点速查
+
+**Q: 非结构化 vs 结构化剪枝的本质区别？**  
+非结构化逐个删权重，产生不规则稀疏矩阵，精度好但需专用硬件加速；结构化删整个 channel/filter，保持矩阵规则性，普通 GPU 直接加速但精度损失更大。
+
+**Q: Magnitude pruning 为什么不是最优的？**  
+因为它只看权重绝对值大小，忽略了 loss 对权重的敏感度。SNIP 的 $|g \cdot w|$ 同时考虑两个因素，更准确。
+
+**Q: 迭代剪枝为什么更好？代价呢？**  
+每次只剪一小部分，微调后模型有时间重新学习权重分布，后续剪枝决策更准。代价是总训练时间 ×N 倍。
+
+**Q: 实际部署 LLM 时怎么做剪枝？**  
+首选 SparseGPT 或 Wanda（激活感知），配合 2:4 稀疏在 Ampere+ GPU 上拿硬件加速。70B+ 模型可用 one-shot 方案避免微调开销。
+
+---
+
+## 8. 代码实战速览
+
+下面给一个 PyTorch 中使用 `torch.nn.utils.prune` 做各种剪枝的最小示例：
 
 ```python
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-import torchvision
-import torchvision.transforms as transforms
-import numpy as np
-import matplotlib.pyplot as plt
-from copy import deepcopy
 
-# ============================================================
-# Part 1: 不同粒度剪枝的 PyTorch 实现
-# ============================================================
+# 定义简单 CNN
+model = nn.Sequential(
+    nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+    nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+    nn.Flatten(),
+    nn.Linear(64 * 7 * 7, 128), nn.ReLU(),
+    nn.Linear(128, 10)
+)
 
-class SimpleCNN(nn.Module):
-    """用于演示剪枝的简单 CNN"""
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.fc1   = nn.Linear(64 * 7 * 7, 128)
-        self.fc2   = nn.Linear(128, 10)
-        self.relu  = nn.ReLU()
-        self.pool  = nn.MaxPool2d(2, 2)
+# --- 非结构化 L1 剪枝（删 50% 的权重）---
+for name, module in model.named_modules():
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        prune.l1_unstructured(module, 'weight', amount=0.5)
 
-    def forward(self, x):
-        x = self.pool(self.relu(self.conv1(x)))   # (B,32,14,14)
-        x = self.pool(self.relu(self.conv2(x)))   # (B,64,7,7)
-        x = x.view(x.size(0), -1)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
+# --- 结构化 Filter 剪枝（删 30% 的 filter）---
+for name, module in model.named_modules():
+    if isinstance(module, nn.Conv2d):
+        prune.ln_structured(module, 'weight', amount=0.3, n=2, dim=0)
 
-
-def count_sparsity(model):
-    """统计模型的全局稀疏度（0 值占比）"""
-    total = 0
-    zeros = 0
-    for name, param in model.named_parameters():
-        if 'weight' in name:
-            total += param.numel()
-            zeros += (param == 0).sum().item()
-    return zeros / total
-
-
-# 1. 非结构化剪枝：逐权重 L1 magnitude pruning
-def unstructured_pruning(model, amount=0.5):
-    """
-    对所有卷积层和全连接层做非结构化 L1 剪枝
-    amount: 剪掉的比例 (0.5 = 50% 的权重置为 0)
-    """
-    model_copy = deepcopy(model)
-    for name, module in model_copy.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.Linear)):
-            # L1 非结构化剪枝：找绝对值最小的 amount 比例的权重，置 0
-            prune.l1_unstructured(module, name='weight', amount=amount)
-    return model_copy
-
-
-# 2. 结构化剪枝：按 L2-norm 删整个 filter (输出 channel)
-def structured_filter_pruning(model, amount=0.3):
-    """
-    对卷积层按 L2-norm 做结构化 filter 剪枝
-    amount: 删掉的 filter 比例
-    """
-    model_copy = deepcopy(model)
-    for name, module in model_copy.named_modules():
-        if isinstance(module, nn.Conv2d):
-            # ln_structured: 按 L2-norm 剪枝，dim=0 是输出 channel 维度
-            prune.ln_structured(
-                module, name='weight', amount=amount, n=2, dim=0
-            )
-    return model_copy
-
-
-# 3. 全局剪枝：所有层共用一个阈值
-def global_unstructured_pruning(model, amount=0.5):
-    """全局 L1 非结构化剪枝：所有层参数一起排序，统一阈值"""
-    model_copy = deepcopy(model)
-    # 收集所有 (module, weight_name) 对
-    parameters_to_prune = []
-    for name, module in model_copy.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.Linear)):
-            parameters_to_prune.append((module, 'weight'))
-
-    prune.global_unstructured(
-        parameters_to_prune,
-        pruning_method=prune.L1Unstructured,
-        amount=amount,
-    )
-    return model_copy
-
-
-# ============================================================
-# Part 2: 手动实现 Magnitude Pruning（不用 torch.prune）
-# ============================================================
-
-def magnitude_pruning_manual(weight_tensor, sparsity):
-    """
-    手动实现 L1 magnitude pruning
-    weight_tensor: 权重张量
-    sparsity: 目标稀疏度，例如 0.9 = 保留最大的 10%
-    返回: 掩码 mask (1 = 保留, 0 = 删除)
-    """
-    # 计算阈值：找到绝对值的第 sparsity 百分位数
-    threshold = torch.quantile(weight_tensor.abs().float(), sparsity)
-    mask = (weight_tensor.abs() >= threshold).float()
-    return mask
-
-
-def apply_mask_and_check(model, sparsity=0.9):
-    """对 fc1 层手动做 magnitude pruning 并验证"""
-    w = model.fc1.weight.data
-    mask = magnitude_pruning_manual(w, sparsity)
-
-    # 应用掩码
-    pruned_w = w * mask
-
-    actual_sparsity = (pruned_w == 0).float().mean().item()
-    print(f"目标稀疏度: {sparsity:.1%}")
-    print(f"实际稀疏度: {actual_sparsity:.1%}")
-    print(f"保留权重数: {(mask == 1).sum().item()} / {mask.numel()}")
-    return mask
-
-
-# ============================================================
-# Part 3: SNIP Saliency 计算
-# ============================================================
-
-def compute_snip_saliency(model, dataloader, criterion, device='cpu'):
-    """
-    计算 SNIP saliency: s_j = |grad_j * w_j|
-    只需要一个 batch 的数据
-    """
-    model = model.to(device)
-    model.train()
-
-    # 只取一个 batch 来计算 saliency
-    images, labels = next(iter(dataloader))
-    images, labels = images.to(device), labels.to(device)
-
-    # 前向+反向传播
-    model.zero_grad()
-    outputs = model(images)
-    loss = criterion(outputs, labels)
-    loss.backward()
-
-    # 计算每层权重的 saliency
-    saliency_dict = {}
-    for name, param in model.named_parameters():
-        if param.grad is not None and 'weight' in name:
-            # saliency = |grad * weight|
-            saliency = (param.grad * param.data).abs()
-            saliency_dict[name] = saliency.detach().cpu()
-            print(f"  {name}: mean saliency = {saliency.mean().item():.6f}, "
-                  f"shape = {saliency.shape}")
-
-    return saliency_dict
-
-
-# ============================================================
-# Part 4: 稀疏度-精度曲线
-# ============================================================
-
-def sparsity_accuracy_curve(model, test_loader, sparsity_levels, device='cpu'):
-    """
-    对不同稀疏度做剪枝，记录精度，画出稀疏度-精度曲线
-    这里只用非结构化 L1 剪枝做演示
-    """
-    criterion = nn.CrossEntropyLoss()
-    results = []
-
-    for sparsity in sparsity_levels:
-        # 对原始模型做剪枝（每次都从原始模型开始）
-        pruned_model = unstructured_pruning(model, amount=sparsity)
-
-        # 评估精度
-        pruned_model.eval()
-        correct = total = 0
-        with torch.no_grad():
-            for images, labels in test_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = pruned_model(images)
-                _, predicted = outputs.max(1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-
-        acc = correct / total
-        actual_sparsity = count_sparsity(pruned_model)
-        results.append((sparsity, actual_sparsity, acc))
-        print(f"目标稀疏度={sparsity:.1%} | "
-              f"实际稀疏度={actual_sparsity:.1%} | "
-              f"精度={acc:.2%}")
-
-    return results
-
-
-# ============================================================
-# Part 5: 演示主程序
-# ============================================================
-
-def demo():
-    torch.manual_seed(42)
-    model = SimpleCNN()
-
-    print("=" * 50)
-    print("原始模型统计")
-    print("=" * 50)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"总参数量: {total_params:,}")
-    print(f"初始稀疏度: {count_sparsity(model):.2%}")
-
-    print("\n" + "=" * 50)
-    print("非结构化剪枝（50%）")
-    print("=" * 50)
-    pruned_unstructured = unstructured_pruning(model, amount=0.5)
-    print(f"稀疏度: {count_sparsity(pruned_unstructured):.2%}")
-    # 验证：权重结构没变，只有值被置 0
-    print(f"conv1.weight shape: {pruned_unstructured.conv1.weight.shape}")
-
-    print("\n" + "=" * 50)
-    print("结构化 Filter 剪枝（30%）")
-    print("=" * 50)
-    pruned_structured = structured_filter_pruning(model, amount=0.3)
-    print(f"稀疏度: {count_sparsity(pruned_structured):.2%}")
-
-    print("\n" + "=" * 50)
-    print("手动 Magnitude Pruning 验证")
-    print("=" * 50)
-    apply_mask_and_check(model, sparsity=0.9)
-
-    print("\n" + "=" * 50)
-    print("全局剪枝（70%）")
-    print("=" * 50)
-    pruned_global = global_unstructured_pruning(model, amount=0.7)
-    print(f"稀疏度: {count_sparsity(pruned_global):.2%}")
-
-    # 打印不同层的稀疏度（全局剪枝下各层稀疏度不同）
-    for name, module in pruned_global.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.Linear)):
-            w = module.weight
-            layer_sparsity = (w == 0).float().mean().item()
-            print(f"  {name}: 稀疏度 = {layer_sparsity:.2%}, shape = {w.shape}")
-
-
-if __name__ == '__main__':
-    demo()
+# --- 全局剪枝（所有层统一阈值，删 70%）---
+params = [(m, 'weight') for m in model.modules() 
+          if isinstance(m, (nn.Conv2d, nn.Linear))]
+prune.global_unstructured(params, pruning_method=prune.L1Unstructured, amount=0.7)
 ```
 
----
+手动实现 magnitude pruning 也只需要几行：
 
-## Infra 实战映射
-
-### vLLM
-
-vLLM 本身主要针对 LLM serving，**不直接实现剪枝**，但与剪枝的交互体现在：
-
-- **加载剪枝后的模型**：vLLM 可以加载用 SparseGPT / Wanda 等工具剪枝后的 HuggingFace 模型（非结构化稀疏权重）。此时 vLLM 仍用稠密计算，剪枝没有实际加速。
-- **结构化剪枝友好**：如果做了 channel pruning 并把模型保存为更小的 `config.json`（hidden_dim 减小），vLLM 加载后可以直接享受加速。
-- **2:4 稀疏**：vLLM roadmap 上有 NVIDIA 2:4 稀疏支持，利用 `cusparseLt` 实现 2x matmul 加速。
-
-实际操作：用 `neural-compressor` 或 `llm-compressor` 做稀疏，然后 vLLM 加载：
 ```python
-# 加载稀疏模型（如 SparseGPT 处理过的 LLaMA）
-from vllm import LLM
-llm = LLM(model="neuralmagic/llama-2-7b-pruned50-retrained", dtype="float16")
+def magnitude_prune(weight, sparsity):
+    """保留 top-(1-sparsity) 的权重"""
+    threshold = torch.quantile(weight.abs().float(), sparsity)
+    mask = (weight.abs() >= threshold).float()
+    return weight * mask
 ```
 
-### TensorRT-LLM
+SNIP saliency 的计算：
 
-NVIDIA 对剪枝的支持更深入：
-
-- **2:4 结构化稀疏（Ampere+）**：TRT-LLM 原生支持，通过 `prune_weights_for_sparse_gpu` 把权重转换为 2:4 格式，推理时用 `cusparseLt` 实现 ~2x matmul 加速，且对精度影响极小。
-- **SparseGPT 集成**：TRT-LLM 的 `ModelOpt` 工具链（`nvidia-modelopt`）集成了 SparseGPT，可以一键对 LLM 做 2:4 剪枝 + 量化：
-  ```bash
-  python hf_ptq.py --model_dir llama-7b --sparsity_fmt dense_and_sparse --qformat int4_awq
-  ```
-- **Structured pruning**：`ModelOpt` 支持 channel pruning，剪枝后直接 export 为更小的 TRT engine。
-
-### 沐曦 MACA
-
-沐曦 GPU（曦云系列）基于 MACA（Metax Advanced Computing Architecture）：
-
-- **非结构化稀疏**：目前 MACA 尚未有像 cuSPARSELt 那样成熟的稀疏加速库。推理非结构化稀疏模型时基本是稠密计算，稀疏没有加速收益。
-- **结构化剪枝**：是目前最务实的选择。Channel pruning 后模型变小，直接在 MACA 上用标准矩阵乘法跑，没有硬件依赖问题。
-- **MACA 特有考虑**：
-  - MACA 的 `mxlib`（对应 cuBLAS）对小 batch size 下的 matmul 优化较弱，结构化剪枝减小 hidden_dim 后效果更明显
-  - 曦思（元脑）推理框架支持加载标准 HuggingFace 格式的剪枝模型
-  - 国产硬件上通常优先做量化（int8/int4）而不是剪枝，因为量化工具链更成熟
+```python
+def snip_saliency(model, dataloader, criterion):
+    """一次前向+反向，计算 |grad * weight|"""
+    images, labels = next(iter(dataloader))
+    model.zero_grad()
+    loss = criterion(model(images), labels)
+    loss.backward()
+    
+    saliency = {}
+    for name, p in model.named_parameters():
+        if p.grad is not None and 'weight' in name:
+            saliency[name] = (p.grad * p.data).abs()
+    return saliency
+```
 
 ---
 
-## 跨 Lecture 关联
+## 9. 知识图谱
 
-- **前置知识** ← Lec02（模型效率基础：FLOPs、参数量、内存带宽）
-- **后续延伸** → Lec04（剪枝进阶：LTH、自动剪枝、硬件稀疏支持）
-- **横向关联** ↔ Lec05/06（量化，可与剪枝组合），Lec09（蒸馏，结构化剪枝后用蒸馏恢复精度）
+本讲在整个课程体系中的位置：
+
+- **前置**：Lec02（FLOPs / 参数量 / Memory Bandwidth 基础概念）
+- **后续**：Lec04（Lottery Ticket Hypothesis, 自动剪枝比率搜索, 2:4 稀疏系统支持）
+- **横向**：Lec05-06（量化，可与剪枝组合）、Lec09（知识蒸馏，用于恢复剪枝后的精度损失）
 
 ---
 
-## 面试高频题
-
-**Q1: 非结构化剪枝和结构化剪枝的本质区别是什么？各自适用场景？**
-
-A: 非结构化剪枝删除单个权重，产生不规则稀疏矩阵，精度损失小但需要专门稀疏硬件（如 NVIDIA 2:4 Sparse）才能加速；结构化剪枝删除整个 channel/filter/layer，保持矩阵规则性，普通 GPU 直接加速，但精度损失通常更大。生产环境优先结构化剪枝，或在 Ampere+ 卡上做 2:4 非结构化剪枝。
-
-**Q2: 为什么 magnitude pruning 不一定是最优准则？**
-
-A: Magnitude pruning 只看权重的绝对值大小，忽略了权重对 loss 的实际影响。一个权重很大，但如果 loss 对它的梯度接近 0（即 loss 对它不敏感），删掉它精度损失也很小。SNIP 的 $|g \cdot w|$ 同时考虑了权重大小和梯度大小，更准确反映权重的重要性。
-
-**Q3: 剪枝后为什么需要微调（fine-tune）？微调时学习率怎么设置？**
-
-A: 剪枝破坏了网络中已经学到的特征表示和层间协作关系，直接剪枝后精度大幅下降。微调让剩余权重重新适应新的网络结构。学习率通常设为原始训练 lr 的 1/10 到 1/100，避免破坏已有的权重分布。一般微调 10-20% 的原始训练 epoch 数就够了。
-
-**Q4: 迭代剪枝比一次性剪枝好在哪里？代价是什么？**
-
-A: 迭代剪枝每次只剪一小部分权重，每次微调后网络有机会重新分配重要性，后续剪枝的判断更准确；一次性剪枝可能误删了重要权重，微调无法完全恢复。代价是训练总开销是 $O(N \times \text{iterations})$，迭代剪枝轮数越多越耗时。
-
-**Q5: 全局剪枝和逐层剪枝，哪个更好？**
-
-A: 通常全局剪枝更好。不同层对精度的敏感度不同：第一层（输入附近）和最后一层（分类头附近）通常更重要，中间层可以剪更多。逐层统一剪枝率会对敏感层剪太多，对不敏感层剪太少。全局剪枝让网络自动平衡。
-
-**Q6: 给一个已部署的 LLM，你会怎么做剪枝？**
-
-A: 首先选择准则：对 LLM 来说，SparseGPT（二阶信息，逐层重建误差最小化）或 Wanda（$|W| \cdot \|X\|_2$，激活感知）效果好于纯 magnitude pruning。其次选择粒度：如果目标是在 NVIDIA Ampere+ GPU 上跑，做 2:4 结构化稀疏；如果是通用场景，做 channel/attention head pruning。最后决定是否微调：小模型 fine-tune 成本低，建议做；70B+ 的 LLM fine-tune 成本极高，可以考虑 SparseGPT 的 one-shot 方案（无需微调）。
+*笔记完。如有错漏，欢迎指正。*
