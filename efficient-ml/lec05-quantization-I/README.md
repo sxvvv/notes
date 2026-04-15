@@ -31,8 +31,7 @@
 量化讨论的第一性原理只有一句话: **bit width 越窄,每次乘加的能耗、面积、访存带宽成比例下降**。这张经典的 45 nm 能耗表(Horowitz ISSCC 2014[^horowitz],Song Han 的课件和 Dally 的 NIPS'15 slides 都在用它)是 efficient AI 的圣经:
 
 <p align="center">
-  <img src="./images/computation_cost.png
-" width="640" alt="Horowitz 2014 energy table"/>
+  <img src="./images/computation_cost.png" width="640" alt="Horowitz 2014 energy table"/>
 </p>
 
 | Operation | Energy (pJ) | 相对 FP32 乘法 |
