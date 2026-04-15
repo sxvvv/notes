@@ -31,7 +31,8 @@
 量化讨论的第一性原理只有一句话: **bit width 越窄,每次乘加的能耗、面积、访存带宽成比例下降**。这张经典的 45 nm 能耗表(Horowitz ISSCC 2014[^horowitz],Song Han 的课件和 Dally 的 NIPS'15 slides 都在用它)是 efficient AI 的圣经:
 
 <p align="center">
-  <img src="./images/01-horowitz-energy-table.png" width="640" alt="Horowitz 2014 energy table"/>
+  <img src="./images/computation_cost.png
+" width="640" alt="Horowitz 2014 energy table"/>
 </p>
 
 | Operation | Energy (pJ) | 相对 FP32 乘法 |
@@ -82,8 +83,6 @@ $$(-1)^{\mathrm{sign}} \times (1 + \mathrm{Fraction}) \times 2^{\mathrm{Exponent
 在 quant kernel 里 subnormal 是个真实的坑:某些硬件(包括早期的 GPU SM)处理 subnormal 走慢路径,会导致一个本来不该发生的 100× 性能塌方。CUDA 的 `-ftz=true` 编译选项就是为此存在的,它把 subnormal 一律刷成零。
 
 ### 5.1.4 FP16 vs BF16:为什么训练几乎都用 BF16
-
-面试必考题,也是新人最容易答错的一题。
 
 <p align="center">
   <img src="./images/02-fp16-vs-bf16-bits.png" width="640" alt="FP16 vs BF16 bit layout"/>
